@@ -13,7 +13,7 @@ void setup() {
 
 	PulseResult initResult = pulse.init();
 	if (!initResult) {
-		Serial.println(initResult.message.c_str());
+		Serial.println(initResult.message);
 		return;
 	}
 
@@ -22,7 +22,7 @@ void setup() {
 	}, 5000);
 
 	if (!timer) {
-		Serial.println(timer.message.c_str());
+		Serial.println(timer.message);
 		return;
 	}
 	timerId = timer.id;

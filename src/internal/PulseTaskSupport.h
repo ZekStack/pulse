@@ -54,6 +54,18 @@ inline size_t currentStackHighWaterMarkBytes() {
 #endif
 }
 
+inline size_t stackHighWaterMarkBytes(TaskHandle_t handle) {
+#if defined(INCLUDE_uxTaskGetStackHighWaterMark) && (INCLUDE_uxTaskGetStackHighWaterMark == 1)
+	if (handle == nullptr) {
+		return 0;
+	}
+	return static_cast<size_t>(uxTaskGetStackHighWaterMark(handle)) * sizeof(StackType_t);
+#else
+	(void)handle;
+	return 0;
+#endif
+}
+
 inline BaseType_t createTask(
     TaskFunction_t entry,
     const char *name,

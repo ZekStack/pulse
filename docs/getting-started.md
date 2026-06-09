@@ -29,7 +29,7 @@ void setup() {
 
 	PulseResult result = pulse.init();
 	if (!result) {
-		Serial.println(result.message.c_str());
+		Serial.println(result.message);
 		return;
 	}
 
@@ -59,6 +59,8 @@ if (result) {
 }
 ```
 
+Control methods are queued. A successful result means the command was accepted by the Pulse command queue, not necessarily already applied.
+
 ## Callback context
 
-Callbacks run from the internal Pulse task. Keep them short. Use Worker for long-running or blocking work.
+Callbacks run from the internal Pulse task. Keep them short. Use Worker for long-running or blocking work. Callbacks may call `clear()`, `pause()`, `resume()`, and `restart()`; those operations are queued until the current callback returns.

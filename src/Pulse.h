@@ -3,7 +3,6 @@
 #include <Arduino.h>
 #include <functional>
 #include <memory>
-#include <string>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -64,7 +63,7 @@ struct PulseConfig {
 struct PulseResult {
 	bool result = false;
 	PulseStatus status = PulseStatus::InternalError;
-	std::string message;
+	const char *message = "internal error";
 
 	explicit operator bool() const {
 		return result;

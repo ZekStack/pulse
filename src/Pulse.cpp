@@ -4,10 +4,11 @@
 #include "internal/PulseTaskSupport.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <new>
-#include <vector>
 
+#include <esp_timer.h>
 #include <freertos/queue.h>
 
 namespace {
@@ -27,6 +28,14 @@ struct PulseCommand {
 	PulseCommandType type = PulseCommandType::Add;
 	PulseTimerId id = kInvalidTimerId;
 };
+
+uint64_t pulseNowMs() {
+	return static_cast<uint64_t>(esp_timer_get_time() / 1000);
+}
+
+bool addWouldOverflow(uint32_t left, uint32_t right) {
+	return left > UINT32_MAX - right;
+}
 
 bool isActiveState(PulseTimerState state) {
 	return state == PulseTimerState::Running || state == PulseTimerState::Paused;
@@ -51,8 +60,11 @@ struct PulseTimerRecord {
 struct PulseImpl {
 	PulseConfig config{};
 	PulseMutex mutex;
-	std::vector<std::shared_ptr<PulseTimerRecord>> timers;
-	std::vector<std::shared_ptr<PulseTimerRecord>> activeTimers;
+	std::unique_ptr<std::shared_ptr<PulseTimerRecord>[]> timers;
+	std::unique_ptr<std::shared_ptr<PulseTimerRecord>[]> activeTimers;
+	uint32_t timerCapacity = 0;
+	uint32_t timerCount = 0;
+	uint32_t activeTimerCount = 0;
 	QueueHandle_t commandQueue = nullptr;
 	TaskHandle_t taskHandle = nullptr;
 	bool initialized = false;
@@ -67,7 +79,8 @@ struct PulseImpl {
 	size_t stackHighWaterMarkBytes = 0;
 
 	std::shared_ptr<PulseTimerRecord> findTimerLocked(PulseTimerId id) {
-		for (auto &timer : timers) {
+		for (uint32_t index = 0; index < timerCount; index++) {
+			auto &timer = timers[index];
 			if (timer && timer->id == id) {
 				return timer;
 			}
@@ -81,7 +94,8 @@ struct PulseImpl {
 
 	uint32_t countTypeLocked(PulseTimerType type) const {
 		uint32_t count = 0;
-		for (const auto &timer : timers) {
+		for (uint32_t index = 0; index < timerCount; index++) {
+			const auto &timer = timers[index];
 			if (timer && timer->type == type && isActiveState(timer->state)) {
 				count++;
 			}
@@ -99,31 +113,61 @@ struct PulseImpl {
 		return countTypeLocked(type) >= config.maxCountdowns;
 	}
 
+	bool allocateTimerIdLocked(PulseTimerId &out) {
+		for (uint32_t attempts = 0; attempts < UINT32_MAX; attempts++) {
+			const PulseTimerId id = nextTimerId++;
+			if (id == kInvalidTimerId) {
+				continue;
+			}
+			if (!hasTimerLocked(id)) {
+				out = id;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool addRegistryLocked(const std::shared_ptr<PulseTimerRecord> &timer) {
+		if (!timer || timerCount >= timerCapacity) {
+			return false;
+		}
+		timers[timerCount++] = timer;
+		return true;
+	}
+
 	void removeActiveLocked(PulseTimerId id) {
-		activeTimers.erase(
-		    std::remove_if(
-		        activeTimers.begin(),
-		        activeTimers.end(),
-		        [id](const std::shared_ptr<PulseTimerRecord> &timer) {
-			        return !timer || timer->id == id;
-		        }
-		    ),
-		    activeTimers.end()
-		);
+		uint32_t writeIndex = 0;
+		for (uint32_t readIndex = 0; readIndex < activeTimerCount; readIndex++) {
+			auto &timer = activeTimers[readIndex];
+			if (timer && timer->id != id) {
+				if (writeIndex != readIndex) {
+					activeTimers[writeIndex] = timer;
+				}
+				writeIndex++;
+			}
+		}
+		for (uint32_t index = writeIndex; index < activeTimerCount; index++) {
+			activeTimers[index].reset();
+		}
+		activeTimerCount = writeIndex;
 	}
 
 	void removeRegistryLocked(PulseTimerId id) {
 		removeActiveLocked(id);
-		timers.erase(
-		    std::remove_if(
-		        timers.begin(),
-		        timers.end(),
-		        [id](const std::shared_ptr<PulseTimerRecord> &timer) {
-			        return !timer || timer->id == id;
-		        }
-		    ),
-		    timers.end()
-		);
+		uint32_t writeIndex = 0;
+		for (uint32_t readIndex = 0; readIndex < timerCount; readIndex++) {
+			auto &timer = timers[readIndex];
+			if (timer && timer->id != id) {
+				if (writeIndex != readIndex) {
+					timers[writeIndex] = timer;
+				}
+				writeIndex++;
+			}
+		}
+		for (uint32_t index = writeIndex; index < timerCount; index++) {
+			timers[index].reset();
+		}
+		timerCount = writeIndex;
 	}
 
 	void insertActiveLocked(const std::shared_ptr<PulseTimerRecord> &timer) {
@@ -131,10 +175,13 @@ struct PulseImpl {
 			return;
 		}
 		removeActiveLocked(timer->id);
-		activeTimers.push_back(timer);
+		if (activeTimerCount >= timerCapacity) {
+			return;
+		}
+		activeTimers[activeTimerCount++] = timer;
 		std::sort(
-		    activeTimers.begin(),
-		    activeTimers.end(),
+		    activeTimers.get(),
+		    activeTimers.get() + activeTimerCount,
 		    [](const std::shared_ptr<PulseTimerRecord> &left,
 		       const std::shared_ptr<PulseTimerRecord> &right) {
 			    if (!left) {
@@ -159,67 +206,47 @@ struct PulseImpl {
 	}
 
 	PulseResult enqueueCommand(PulseCommandType type, PulseTimerId id, TickType_t timeout = 0) {
-		PulseCommand *command = new (std::nothrow) PulseCommand();
-		if (command == nullptr) {
-			return PulseResult::failure(PulseStatus::OutOfMemory, "failed to allocate command");
-		}
-		command->type = type;
-		command->id = id;
+		PulseCommand command;
+		command.type = type;
+		command.id = id;
 
-		if (commandQueue == nullptr ||
-		    xQueueSend(commandQueue, &command, timeout) != pdTRUE) {
-			delete command;
+		if (commandQueue == nullptr || xQueueSend(commandQueue, &command, timeout) != pdTRUE) {
 			incrementDroppedCommand();
 			return PulseResult::failure(PulseStatus::QueueFull, "pulse command queue is full");
 		}
 		return PulseResult::success("command queued");
 	}
 
-	void drainCommandQueue() {
-		if (commandQueue == nullptr) {
-			return;
-		}
-		PulseCommand *command = nullptr;
-		while (xQueueReceive(commandQueue, &command, 0) == pdTRUE) {
-			delete command;
-			command = nullptr;
-		}
-	}
-
-	void processCommand(PulseCommand *command) {
-		if (command == nullptr) {
-			return;
-		}
-
-		const uint64_t nowMs = millis();
+	void processCommand(const PulseCommand &command) {
+		const uint64_t nowMs = pulseNowMs();
 		PulseLock lock(mutex);
 		if (!lock) {
 			return;
 		}
 
-		if (command->type == PulseCommandType::Shutdown) {
+		if (command.type == PulseCommandType::Shutdown) {
 			stopping = true;
 			return;
 		}
 
-		auto timer = findTimerLocked(command->id);
+		auto timer = findTimerLocked(command.id);
 		if (!timer) {
 			return;
 		}
 
-		if (command->type == PulseCommandType::Add) {
+		if (command.type == PulseCommandType::Add) {
 			if (timer->state == PulseTimerState::Running) {
 				insertActiveLocked(timer);
 			}
 			return;
 		}
 
-		if (command->type == PulseCommandType::Clear) {
-			removeRegistryLocked(command->id);
+		if (command.type == PulseCommandType::Clear) {
+			removeRegistryLocked(command.id);
 			return;
 		}
 
-		if (command->type == PulseCommandType::Pause) {
+		if (command.type == PulseCommandType::Pause) {
 			if (timer->state == PulseTimerState::Running) {
 				timer->remainingDelayMs =
 				    timer->nextDueMs > nowMs ? static_cast<uint32_t>(timer->nextDueMs - nowMs) : 1;
@@ -229,7 +256,7 @@ struct PulseImpl {
 			return;
 		}
 
-		if (command->type == PulseCommandType::Resume) {
+		if (command.type == PulseCommandType::Resume) {
 			if (timer->state == PulseTimerState::Paused) {
 				const uint32_t delayMs = timer->remainingDelayMs > 0 ? timer->remainingDelayMs : 1;
 				timer->nextDueMs = nowMs + delayMs;
@@ -240,7 +267,7 @@ struct PulseImpl {
 			return;
 		}
 
-		if (command->type == PulseCommandType::Restart) {
+		if (command.type == PulseCommandType::Restart) {
 			timer->state = PulseTimerState::Running;
 			timer->remainingDelayMs = 0;
 			if (timer->type == PulseTimerType::Countdown) {
@@ -260,17 +287,17 @@ struct PulseImpl {
 		if (!lock || stopping) {
 			return 0;
 		}
-		while (!activeTimers.empty() && !activeTimers.front()) {
-			activeTimers.erase(activeTimers.begin());
+		while (activeTimerCount > 0 && !activeTimers[0]) {
+			removeActiveLocked(kInvalidTimerId);
 		}
-		if (activeTimers.empty()) {
+		if (activeTimerCount == 0) {
 			return portMAX_DELAY;
 		}
-		const uint64_t nowMs = millis();
-		if (activeTimers.front()->nextDueMs <= nowMs) {
+		const uint64_t nowMs = pulseNowMs();
+		if (activeTimers[0]->nextDueMs <= nowMs) {
 			return 0;
 		}
-		uint64_t remainingMs = activeTimers.front()->nextDueMs - nowMs;
+		uint64_t remainingMs = activeTimers[0]->nextDueMs - nowMs;
 		if (remainingMs > UINT32_MAX) {
 			remainingMs = UINT32_MAX;
 		}
@@ -279,18 +306,14 @@ struct PulseImpl {
 	}
 
 	void processQueuedCommands(TickType_t waitTicks) {
-		PulseCommand *command = nullptr;
+		PulseCommand command;
 		if (xQueueReceive(commandQueue, &command, waitTicks) != pdTRUE) {
 			return;
 		}
 		processCommand(command);
-		delete command;
-		command = nullptr;
 
 		while (xQueueReceive(commandQueue, &command, 0) == pdTRUE) {
 			processCommand(command);
-			delete command;
-			command = nullptr;
 		}
 	}
 
@@ -299,17 +322,17 @@ struct PulseImpl {
 		if (!lock) {
 			return false;
 		}
-		const uint64_t nowMs = millis();
-		while (!activeTimers.empty()) {
-			auto timer = activeTimers.front();
+		const uint64_t nowMs = pulseNowMs();
+		while (activeTimerCount > 0) {
+			auto timer = activeTimers[0];
 			if (!timer) {
-				activeTimers.erase(activeTimers.begin());
+				removeActiveLocked(kInvalidTimerId);
 				continue;
 			}
 			if (timer->nextDueMs > nowMs) {
 				return false;
 			}
-			activeTimers.erase(activeTimers.begin());
+			removeActiveLocked(timer->id);
 			if (timer->state != PulseTimerState::Running || !hasTimerLocked(timer->id)) {
 				continue;
 			}
@@ -382,7 +405,7 @@ struct PulseImpl {
 
 			if (timer->type == PulseTimerType::Interval) {
 				if (timer->state == PulseTimerState::Running && hasTimerLocked(timer->id)) {
-					timer->nextDueMs = static_cast<uint64_t>(millis()) + timer->intervalMs;
+					timer->nextDueMs = pulseNowMs() + timer->intervalMs;
 					insertActiveLocked(timer);
 				}
 				return;
@@ -395,7 +418,7 @@ struct PulseImpl {
 					const uint32_t remainingMs =
 					    timer->durationMs > timer->elapsedMs ? timer->durationMs - timer->elapsedMs : 0;
 					const uint32_t nextDelayMs = std::min(timer->tickMs, remainingMs);
-					timer->nextDueMs = static_cast<uint64_t>(millis()) + nextDelayMs;
+					timer->nextDueMs = pulseNowMs() + nextDelayMs;
 					insertActiveLocked(timer);
 				}
 			}
@@ -503,6 +526,18 @@ PulseResult Pulse::init(const PulseConfig &config) {
 	if (config.commandQueueSize == 0) {
 		return PulseResult::failure(PulseStatus::InvalidArgument, "command queue size is required");
 	}
+	if (addWouldOverflow(config.maxTimeouts, config.maxIntervals) ||
+	    addWouldOverflow(config.maxTimeouts + config.maxIntervals, config.maxCountdowns)) {
+		return PulseResult::failure(PulseStatus::InvalidArgument, "timer capacity overflow");
+	}
+	const uint32_t timerCapacity =
+	    config.maxTimeouts + config.maxIntervals + config.maxCountdowns;
+	if (timerCapacity == 0) {
+		return PulseResult::failure(
+		    PulseStatus::InvalidArgument,
+		    "at least one timer slot is required"
+		);
+	}
 
 	bool usePsramStack = false;
 	PulseStackType actualStackType = PulseStackType::Internal;
@@ -540,13 +575,35 @@ PulseResult Pulse::init(const PulseConfig &config) {
 		_impl->lateCallbackCount = 0;
 		_impl->stackHighWaterMarkBytes = 0;
 		_impl->nextTimerId = 1;
+		_impl->timerCapacity = timerCapacity;
+		_impl->timerCount = 0;
+		_impl->activeTimerCount = 0;
+		_impl->timers.reset(
+		    new (std::nothrow) std::shared_ptr<PulseTimerRecord>[timerCapacity]
+		);
+		_impl->activeTimers.reset(
+		    new (std::nothrow) std::shared_ptr<PulseTimerRecord>[timerCapacity]
+		);
+		if (!_impl->timers || !_impl->activeTimers) {
+			_impl->timers.reset();
+			_impl->activeTimers.reset();
+			_impl->timerCapacity = 0;
+			_impl->taskStopped = true;
+			return PulseResult::failure(
+			    PulseStatus::OutOfMemory,
+			    "failed to allocate timer storage"
+			);
+		}
 	}
 
-	_impl->commandQueue = xQueueCreate(config.commandQueueSize, sizeof(PulseCommand *));
+	_impl->commandQueue = xQueueCreate(config.commandQueueSize, sizeof(PulseCommand));
 	if (_impl->commandQueue == nullptr) {
 		PulseLock lock(_impl->mutex);
 		if (lock) {
 			_impl->taskStopped = true;
+			_impl->timers.reset();
+			_impl->activeTimers.reset();
+			_impl->timerCapacity = 0;
 		}
 		return PulseResult::failure(PulseStatus::QueueCreateFailed, "failed to create command queue");
 	}
@@ -570,6 +627,9 @@ PulseResult Pulse::init(const PulseConfig &config) {
 		PulseLock lock(_impl->mutex);
 		if (lock) {
 			_impl->taskStopped = true;
+			_impl->timers.reset();
+			_impl->activeTimers.reset();
+			_impl->timerCapacity = 0;
 		}
 		return PulseResult::failure(PulseStatus::TaskCreateFailed, "failed to create pulse task");
 	}
@@ -610,7 +670,7 @@ PulseResult Pulse::end(uint32_t timeoutMs) {
 		}
 	}
 
-	const uint64_t startMs = millis();
+	const uint64_t startMs = pulseNowMs();
 	while (true) {
 		bool stopped = false;
 		{
@@ -622,7 +682,7 @@ PulseResult Pulse::end(uint32_t timeoutMs) {
 		if (stopped) {
 			break;
 		}
-		if (static_cast<uint64_t>(millis()) - startMs >= timeoutMs) {
+		if (pulseNowMs() - startMs >= timeoutMs) {
 			return PulseResult::failure(PulseStatus::Timeout, "pulse end timed out");
 		}
 		vTaskDelay(pdMS_TO_TICKS(kWaitPollMs));
@@ -631,15 +691,23 @@ PulseResult Pulse::end(uint32_t timeoutMs) {
 	{
 		PulseLock lock(_impl->mutex);
 		if (lock) {
-			_impl->timers.clear();
-			_impl->activeTimers.clear();
+			for (uint32_t index = 0; index < _impl->timerCount; index++) {
+				_impl->timers[index].reset();
+			}
+			for (uint32_t index = 0; index < _impl->activeTimerCount; index++) {
+				_impl->activeTimers[index].reset();
+			}
+			_impl->timerCount = 0;
+			_impl->activeTimerCount = 0;
+			_impl->timerCapacity = 0;
+			_impl->timers.reset();
+			_impl->activeTimers.reset();
 			_impl->initialized = false;
 			_impl->stopping = false;
 			_impl->taskStopped = true;
 			_impl->nextTimerId = 1;
 		}
 	}
-	_impl->drainCommandQueue();
 	if (_impl->commandQueue != nullptr) {
 		vQueueDelete(_impl->commandQueue);
 		_impl->commandQueue = nullptr;
@@ -655,10 +723,11 @@ PulseTimerResult Pulse::setTimeout(PulseCallback callback, uint32_t delayMs) {
 		return PulseTimerResult::failure(PulseStatus::InvalidArgument, "delay is required");
 	}
 
-	std::shared_ptr<PulseTimerRecord> timer(new (std::nothrow) PulseTimerRecord());
-	if (!timer) {
+	PulseTimerRecord *rawTimer = new (std::nothrow) PulseTimerRecord();
+	if (rawTimer == nullptr) {
 		return PulseTimerResult::failure(PulseStatus::OutOfMemory, "failed to allocate timer");
 	}
+	std::shared_ptr<PulseTimerRecord> timer(rawTimer);
 
 	{
 		PulseLock lock(_impl->mutex);
@@ -671,13 +740,17 @@ PulseTimerResult Pulse::setTimeout(PulseCallback callback, uint32_t delayMs) {
 		if (_impl->limitReachedLocked(PulseTimerType::Timeout)) {
 			return PulseTimerResult::failure(PulseStatus::Busy, "timeout limit reached");
 		}
-		timer->id = _impl->nextTimerId++;
+		if (!_impl->allocateTimerIdLocked(timer->id)) {
+			return PulseTimerResult::failure(PulseStatus::InternalError, "timer id exhausted");
+		}
 		timer->type = PulseTimerType::Timeout;
 		timer->state = PulseTimerState::Running;
 		timer->callback = callback;
 		timer->delayMs = delayMs;
-		timer->nextDueMs = static_cast<uint64_t>(millis()) + delayMs;
-		_impl->timers.push_back(timer);
+		timer->nextDueMs = pulseNowMs() + delayMs;
+		if (!_impl->addRegistryLocked(timer)) {
+			return PulseTimerResult::failure(PulseStatus::Busy, "timer storage is full");
+		}
 	}
 
 	PulseResult queued = _impl->enqueueCommand(PulseCommandType::Add, timer->id);
@@ -686,7 +759,7 @@ PulseTimerResult Pulse::setTimeout(PulseCallback callback, uint32_t delayMs) {
 		if (lock) {
 			_impl->removeRegistryLocked(timer->id);
 		}
-		return PulseTimerResult::failure(queued.status, queued.message.c_str(), timer->id);
+		return PulseTimerResult::failure(queued.status, queued.message, timer->id);
 	}
 	return PulseTimerResult::success(timer->id, "timeout scheduled");
 }
@@ -699,10 +772,11 @@ PulseTimerResult Pulse::setInterval(PulseCallback callback, uint32_t intervalMs)
 		return PulseTimerResult::failure(PulseStatus::InvalidArgument, "interval is required");
 	}
 
-	std::shared_ptr<PulseTimerRecord> timer(new (std::nothrow) PulseTimerRecord());
-	if (!timer) {
+	PulseTimerRecord *rawTimer = new (std::nothrow) PulseTimerRecord();
+	if (rawTimer == nullptr) {
 		return PulseTimerResult::failure(PulseStatus::OutOfMemory, "failed to allocate timer");
 	}
+	std::shared_ptr<PulseTimerRecord> timer(rawTimer);
 
 	{
 		PulseLock lock(_impl->mutex);
@@ -715,13 +789,17 @@ PulseTimerResult Pulse::setInterval(PulseCallback callback, uint32_t intervalMs)
 		if (_impl->limitReachedLocked(PulseTimerType::Interval)) {
 			return PulseTimerResult::failure(PulseStatus::Busy, "interval limit reached");
 		}
-		timer->id = _impl->nextTimerId++;
+		if (!_impl->allocateTimerIdLocked(timer->id)) {
+			return PulseTimerResult::failure(PulseStatus::InternalError, "timer id exhausted");
+		}
 		timer->type = PulseTimerType::Interval;
 		timer->state = PulseTimerState::Running;
 		timer->callback = callback;
 		timer->intervalMs = intervalMs;
-		timer->nextDueMs = static_cast<uint64_t>(millis()) + intervalMs;
-		_impl->timers.push_back(timer);
+		timer->nextDueMs = pulseNowMs() + intervalMs;
+		if (!_impl->addRegistryLocked(timer)) {
+			return PulseTimerResult::failure(PulseStatus::Busy, "timer storage is full");
+		}
 	}
 
 	PulseResult queued = _impl->enqueueCommand(PulseCommandType::Add, timer->id);
@@ -730,7 +808,7 @@ PulseTimerResult Pulse::setInterval(PulseCallback callback, uint32_t intervalMs)
 		if (lock) {
 			_impl->removeRegistryLocked(timer->id);
 		}
-		return PulseTimerResult::failure(queued.status, queued.message.c_str(), timer->id);
+		return PulseTimerResult::failure(queued.status, queued.message, timer->id);
 	}
 	return PulseTimerResult::success(timer->id, "interval scheduled");
 }
@@ -755,10 +833,11 @@ PulseTimerResult Pulse::setCountdown(
 		);
 	}
 
-	std::shared_ptr<PulseTimerRecord> timer(new (std::nothrow) PulseTimerRecord());
-	if (!timer) {
+	PulseTimerRecord *rawTimer = new (std::nothrow) PulseTimerRecord();
+	if (rawTimer == nullptr) {
 		return PulseTimerResult::failure(PulseStatus::OutOfMemory, "failed to allocate timer");
 	}
+	std::shared_ptr<PulseTimerRecord> timer(rawTimer);
 
 	{
 		PulseLock lock(_impl->mutex);
@@ -771,15 +850,19 @@ PulseTimerResult Pulse::setCountdown(
 		if (_impl->limitReachedLocked(PulseTimerType::Countdown)) {
 			return PulseTimerResult::failure(PulseStatus::Busy, "countdown limit reached");
 		}
-		timer->id = _impl->nextTimerId++;
+		if (!_impl->allocateTimerIdLocked(timer->id)) {
+			return PulseTimerResult::failure(PulseStatus::InternalError, "timer id exhausted");
+		}
 		timer->type = PulseTimerType::Countdown;
 		timer->state = PulseTimerState::Running;
 		timer->countdownCallback = callback;
 		timer->durationMs = config.durationMs;
 		timer->tickMs = config.tickMs;
 		timer->elapsedMs = 0;
-		timer->nextDueMs = static_cast<uint64_t>(millis()) + config.tickMs;
-		_impl->timers.push_back(timer);
+		timer->nextDueMs = pulseNowMs() + config.tickMs;
+		if (!_impl->addRegistryLocked(timer)) {
+			return PulseTimerResult::failure(PulseStatus::Busy, "timer storage is full");
+		}
 	}
 
 	PulseResult queued = _impl->enqueueCommand(PulseCommandType::Add, timer->id);
@@ -788,7 +871,7 @@ PulseTimerResult Pulse::setCountdown(
 		if (lock) {
 			_impl->removeRegistryLocked(timer->id);
 		}
-		return PulseTimerResult::failure(queued.status, queued.message.c_str(), timer->id);
+		return PulseTimerResult::failure(queued.status, queued.message, timer->id);
 	}
 	return PulseTimerResult::success(timer->id, "countdown scheduled");
 }
@@ -928,37 +1011,46 @@ PulseTimerState Pulse::getState(PulseTimerId id) {
 
 PulseDiag Pulse::getDiagnostics() {
 	PulseDiag diag;
-	PulseLock lock(_impl->mutex);
-	if (!lock) {
-		return diag;
-	}
-	diag.commandQueueSize = _impl->config.commandQueueSize;
-	diag.commandQueueUsed = _impl->commandQueue != nullptr ?
-	                            static_cast<uint32_t>(uxQueueMessagesWaiting(_impl->commandQueue)) :
-	                            0;
-	diag.executedCallbackCount = _impl->executedCallbackCount;
-	diag.droppedCommandCount = _impl->droppedCommandCount;
-	diag.lateCallbackCount = _impl->lateCallbackCount;
-	diag.stackHighWaterMarkBytes = _impl->stackHighWaterMarkBytes;
-	diag.requestedStackType = _impl->config.stackType;
-	diag.actualStackType = _impl->actualStackType;
+	TaskHandle_t handle = nullptr;
+	{
+		PulseLock lock(_impl->mutex);
+		if (!lock) {
+			return diag;
+		}
+		handle = _impl->taskHandle;
+		diag.commandQueueSize = _impl->config.commandQueueSize;
+		diag.commandQueueUsed =
+		    _impl->commandQueue != nullptr ?
+		        static_cast<uint32_t>(uxQueueMessagesWaiting(_impl->commandQueue)) :
+		        0;
+		diag.executedCallbackCount = _impl->executedCallbackCount;
+		diag.droppedCommandCount = _impl->droppedCommandCount;
+		diag.lateCallbackCount = _impl->lateCallbackCount;
+		diag.stackHighWaterMarkBytes = _impl->stackHighWaterMarkBytes;
+		diag.requestedStackType = _impl->config.stackType;
+		diag.actualStackType = _impl->actualStackType;
 
-	for (const auto &timer : _impl->timers) {
-		if (!timer) {
-			continue;
+		for (uint32_t index = 0; index < _impl->timerCount; index++) {
+			const auto &timer = _impl->timers[index];
+			if (!timer) {
+				continue;
+			}
+			if (timer->type == PulseTimerType::Timeout) {
+				diag.timeoutCount++;
+			} else if (timer->type == PulseTimerType::Interval) {
+				diag.intervalCount++;
+			} else {
+				diag.countdownCount++;
+			}
+			if (timer->state == PulseTimerState::Running) {
+				diag.runningCount++;
+			} else if (timer->state == PulseTimerState::Paused) {
+				diag.pausedCount++;
+			}
 		}
-		if (timer->type == PulseTimerType::Timeout) {
-			diag.timeoutCount++;
-		} else if (timer->type == PulseTimerType::Interval) {
-			diag.intervalCount++;
-		} else {
-			diag.countdownCount++;
-		}
-		if (timer->state == PulseTimerState::Running) {
-			diag.runningCount++;
-		} else if (timer->state == PulseTimerState::Paused) {
-			diag.pausedCount++;
-		}
+	}
+	if (handle != nullptr) {
+		diag.stackHighWaterMarkBytes = pulse_task_support::stackHighWaterMarkBytes(handle);
 	}
 	return diag;
 }

@@ -18,7 +18,7 @@ void setup() {
 
 	PulseResult initResult = pulse.init(config);
 	if (!initResult) {
-		Serial.println(initResult.message.c_str());
+		Serial.println(initResult.message);
 		return;
 	}
 
@@ -31,7 +31,7 @@ void setup() {
 	}, 5000);
 
 	if (!second) {
-		Serial.printf("limit failure: %s\n", second.message.c_str());
+		Serial.printf("limit failure: %s\n", second.message);
 	}
 }
 

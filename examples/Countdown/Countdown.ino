@@ -8,7 +8,7 @@ void setup() {
 
 	PulseResult initResult = pulse.init();
 	if (!initResult) {
-		Serial.println(initResult.message.c_str());
+		Serial.println(initResult.message);
 		return;
 	}
 

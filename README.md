@@ -10,9 +10,9 @@ Pulse helps you schedule short runtime timeouts, intervals, and countdowns in Ar
 
 ## Why use Pulse?
 
-* **Uptime timers** - all timing is based on monotonic `millis()` runtime.
+* **Uptime timers** - all timing is based on ESP-IDF's monotonic runtime timer.
 * **One task** - timeouts, intervals, and countdowns are coordinated by one internal Pulse task.
-* **Bounded memory** - configured limits cap each timer type and the command queue.
+* **Bounded counts** - configured limits cap each timer type and the command queue.
 * **Task-side callbacks** - callbacks run from the internal Pulse task.
 * **Production-minded** - result-based errors, diagnostics, thread-safe internals, and no exceptions.
 
@@ -59,7 +59,7 @@ void setup() {
 
 	PulseResult initResult = pulse.init();
 	if (!initResult) {
-		Serial.println(initResult.message.c_str());
+		Serial.println(initResult.message);
 		return;
 	}
 
@@ -88,9 +88,22 @@ void loop() {
 
 * `setInterval()` uses delay-after-callback timing and does not catch up missed ticks.
 * Countdown callbacks first run after `tickMs`; the final callback is guaranteed with `isFinished=true`.
+* `clear()`, `pause()`, `resume()`, and `restart()` are queued control commands.
 * Zero-millisecond timer values are rejected.
 * Stack sizes are FreeRTOS byte sizes on ESP32 and must be at least 1024 bytes.
 * `PulseStackType::Auto` prefers PSRAM task stacks when supported and falls back to internal RAM.
+
+## Timing guarantees
+
+Pulse uses ESP-IDF's 64-bit monotonic runtime timer internally. It is intended for short runtime timers, not wall-clock scheduling.
+
+## Threading model
+
+All callbacks run from the internal Pulse task. Control methods are thread-safe and queued, so a successful `clear()`, `pause()`, `resume()`, or `restart()` means the command was accepted, not necessarily already applied. Pulse callbacks may call these control methods; the queued operation takes effect after the current callback returns.
+
+## Memory model
+
+Pulse has bounded timer counts and preallocated internal timer pointer storage, but timer records, user callbacks, and `std::function` captures may allocate.
 
 ## Examples
 
@@ -183,7 +196,7 @@ Pulse reports operation status through `PulseResult` and `PulseTimerResult`.
 PulseTimerResult result = pulse.setTimeout([]() {}, 1000);
 
 if (!result) {
-	Serial.println(result.message.c_str());
+	Serial.println(result.message);
 	return;
 }
 ```
