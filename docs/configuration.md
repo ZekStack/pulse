@@ -36,7 +36,9 @@ The timer limits are per type:
 
 If a limit is reached, creation returns a failed `PulseTimerResult`.
 
-During `init()`, Pulse validates that the configured timer limits have a non-zero total and do not overflow. It then allocates pre-sized internal pointer arrays for `maxTimeouts + maxIntervals + maxCountdowns` timer slots. Timer records, user callbacks, and `std::function` captures may still allocate.
+During `init()`, Pulse validates that the configured timer limits have a non-zero total and do not overflow. It then allocates pre-sized internal pointer arrays for `maxTimeouts + maxIntervals + maxCountdowns` timer slots. Timer records, `shared_ptr` control blocks, user callbacks, and `std::function` captures may still allocate.
+
+Fully fixed-capacity timer record storage is planned for a later hardening pass.
 
 The command queue stores control commands by value. If the queue is full, queued operations return `PulseStatus::QueueFull`.
 

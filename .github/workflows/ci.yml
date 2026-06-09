@@ -26,7 +26,36 @@ jobs:
       - name: Audit production sources
         run: |
           if grep -RInE '(^|[^[:alnum:]_])throw([^[:alnum:]_]|$)|std::abort[[:space:]]*\(' src; then
-            echo "Embedded safety audit failed"
+            echo "Embedded safety audit failed: throw/std::abort is not allowed"
+            exit 1
+          fi
+          if grep -RInF 'millis()' src; then
+            echo "Embedded safety audit failed: use pulseNowMs() instead of millis()"
+            exit 1
+          fi
+          if grep -RInF 'std::vector' src; then
+            echo "Embedded safety audit failed: std::vector is not allowed in production sources"
+            exit 1
+          fi
+          if grep -RInF 'std::string' src; then
+            echo "Embedded safety audit failed: std::string is not allowed in production sources"
+            exit 1
+          fi
+          if grep -RInF 'sizeof(PulseCommand *)' src; then
+            echo "Embedded safety audit failed: PulseCommand queue must store values"
+            exit 1
+          fi
+          if grep -RInF 'new (std::nothrow) PulseCommand' src; then
+            echo "Embedded safety audit failed: PulseCommand must not be heap allocated"
+            exit 1
+          fi
+          if grep -RInF 'delete command' src; then
+            echo "Embedded safety audit failed: PulseCommand must not require delete"
+            exit 1
+          fi
+          result_message_accessor='.message'
+          if grep -RInF "${result_message_accessor}.c_str()" .; then
+            echo "Embedded safety audit failed: result messages are const char pointers"
             exit 1
           fi
 

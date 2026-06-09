@@ -113,6 +113,25 @@ struct PulseImpl {
 		return countTypeLocked(type) >= config.maxCountdowns;
 	}
 
+	PulseTimerResult validateTimerCreateLocked(
+	    PulseTimerType type,
+	    const char *limitMessage
+	) const {
+		if (!initialized || stopping) {
+			return PulseTimerResult::failure(
+			    PulseStatus::NotInitialized,
+			    "pulse is not initialized"
+			);
+		}
+		if (limitReachedLocked(type)) {
+			return PulseTimerResult::failure(PulseStatus::Busy, limitMessage);
+		}
+		if (timerCount >= timerCapacity) {
+			return PulseTimerResult::failure(PulseStatus::Busy, "timer storage is full");
+		}
+		return PulseTimerResult::success(kInvalidTimerId);
+	}
+
 	bool allocateTimerIdLocked(PulseTimerId &out) {
 		for (uint32_t attempts = 0; attempts < UINT32_MAX; attempts++) {
 			const PulseTimerId id = nextTimerId++;
@@ -723,6 +742,18 @@ PulseTimerResult Pulse::setTimeout(PulseCallback callback, uint32_t delayMs) {
 		return PulseTimerResult::failure(PulseStatus::InvalidArgument, "delay is required");
 	}
 
+	{
+		PulseLock lock(_impl->mutex);
+		if (!lock) {
+			return PulseTimerResult::failure(PulseStatus::InternalError, "failed to lock pulse");
+		}
+		PulseTimerResult preflight =
+		    _impl->validateTimerCreateLocked(PulseTimerType::Timeout, "timeout limit reached");
+		if (!preflight) {
+			return preflight;
+		}
+	}
+
 	PulseTimerRecord *rawTimer = new (std::nothrow) PulseTimerRecord();
 	if (rawTimer == nullptr) {
 		return PulseTimerResult::failure(PulseStatus::OutOfMemory, "failed to allocate timer");
@@ -734,11 +765,10 @@ PulseTimerResult Pulse::setTimeout(PulseCallback callback, uint32_t delayMs) {
 		if (!lock) {
 			return PulseTimerResult::failure(PulseStatus::InternalError, "failed to lock pulse");
 		}
-		if (!_impl->initialized || _impl->stopping) {
-			return PulseTimerResult::failure(PulseStatus::NotInitialized, "pulse is not initialized");
-		}
-		if (_impl->limitReachedLocked(PulseTimerType::Timeout)) {
-			return PulseTimerResult::failure(PulseStatus::Busy, "timeout limit reached");
+		PulseTimerResult preflight =
+		    _impl->validateTimerCreateLocked(PulseTimerType::Timeout, "timeout limit reached");
+		if (!preflight) {
+			return preflight;
 		}
 		if (!_impl->allocateTimerIdLocked(timer->id)) {
 			return PulseTimerResult::failure(PulseStatus::InternalError, "timer id exhausted");
@@ -772,6 +802,18 @@ PulseTimerResult Pulse::setInterval(PulseCallback callback, uint32_t intervalMs)
 		return PulseTimerResult::failure(PulseStatus::InvalidArgument, "interval is required");
 	}
 
+	{
+		PulseLock lock(_impl->mutex);
+		if (!lock) {
+			return PulseTimerResult::failure(PulseStatus::InternalError, "failed to lock pulse");
+		}
+		PulseTimerResult preflight =
+		    _impl->validateTimerCreateLocked(PulseTimerType::Interval, "interval limit reached");
+		if (!preflight) {
+			return preflight;
+		}
+	}
+
 	PulseTimerRecord *rawTimer = new (std::nothrow) PulseTimerRecord();
 	if (rawTimer == nullptr) {
 		return PulseTimerResult::failure(PulseStatus::OutOfMemory, "failed to allocate timer");
@@ -783,11 +825,10 @@ PulseTimerResult Pulse::setInterval(PulseCallback callback, uint32_t intervalMs)
 		if (!lock) {
 			return PulseTimerResult::failure(PulseStatus::InternalError, "failed to lock pulse");
 		}
-		if (!_impl->initialized || _impl->stopping) {
-			return PulseTimerResult::failure(PulseStatus::NotInitialized, "pulse is not initialized");
-		}
-		if (_impl->limitReachedLocked(PulseTimerType::Interval)) {
-			return PulseTimerResult::failure(PulseStatus::Busy, "interval limit reached");
+		PulseTimerResult preflight =
+		    _impl->validateTimerCreateLocked(PulseTimerType::Interval, "interval limit reached");
+		if (!preflight) {
+			return preflight;
 		}
 		if (!_impl->allocateTimerIdLocked(timer->id)) {
 			return PulseTimerResult::failure(PulseStatus::InternalError, "timer id exhausted");
@@ -833,6 +874,18 @@ PulseTimerResult Pulse::setCountdown(
 		);
 	}
 
+	{
+		PulseLock lock(_impl->mutex);
+		if (!lock) {
+			return PulseTimerResult::failure(PulseStatus::InternalError, "failed to lock pulse");
+		}
+		PulseTimerResult preflight =
+		    _impl->validateTimerCreateLocked(PulseTimerType::Countdown, "countdown limit reached");
+		if (!preflight) {
+			return preflight;
+		}
+	}
+
 	PulseTimerRecord *rawTimer = new (std::nothrow) PulseTimerRecord();
 	if (rawTimer == nullptr) {
 		return PulseTimerResult::failure(PulseStatus::OutOfMemory, "failed to allocate timer");
@@ -844,11 +897,10 @@ PulseTimerResult Pulse::setCountdown(
 		if (!lock) {
 			return PulseTimerResult::failure(PulseStatus::InternalError, "failed to lock pulse");
 		}
-		if (!_impl->initialized || _impl->stopping) {
-			return PulseTimerResult::failure(PulseStatus::NotInitialized, "pulse is not initialized");
-		}
-		if (_impl->limitReachedLocked(PulseTimerType::Countdown)) {
-			return PulseTimerResult::failure(PulseStatus::Busy, "countdown limit reached");
+		PulseTimerResult preflight =
+		    _impl->validateTimerCreateLocked(PulseTimerType::Countdown, "countdown limit reached");
+		if (!preflight) {
+			return preflight;
 		}
 		if (!_impl->allocateTimerIdLocked(timer->id)) {
 			return PulseTimerResult::failure(PulseStatus::InternalError, "timer id exhausted");

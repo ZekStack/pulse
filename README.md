@@ -105,6 +105,8 @@ All callbacks run from the internal Pulse task. Control methods are thread-safe 
 
 Pulse has bounded timer counts and preallocated internal timer pointer storage, but timer records, user callbacks, and `std::function` captures may allocate.
 
+Timer records and `shared_ptr` control blocks still allocate dynamically. Fully fixed-capacity timer record storage is planned for a later hardening pass.
+
 ## Examples
 
 | Example | Description |
