@@ -6,6 +6,7 @@
 void fakeAdvanceTimeMs(uint64_t milliseconds);
 void fakeWakeAllTasks();
 void fakeSetStackHighWaterMark(size_t bytes);
+size_t fakeActiveTaskCount();
 
 void fakeSuspendTaskNotifications();
 void fakeResumeTaskNotifications();
