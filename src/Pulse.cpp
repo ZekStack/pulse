@@ -4,16 +4,32 @@
 #include "internal/PulseTaskSupport.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <new>
+#include <utility>
 
 #include <esp_timer.h>
+#include <freertos/event_groups.h>
 #include <freertos/queue.h>
 
 namespace {
 constexpr PulseTimerId kInvalidTimerId = 0;
 constexpr uint32_t kWaitPollMs = 10;
+constexpr EventBits_t kCompletionBit = BIT0;
+
+enum class PulseLifecycleState : uint8_t {
+	Uninitialized,
+	Running,
+	Stopping,
+	Stopped,
+};
+
+enum class PulseExecutionState : uint8_t {
+	Idle,
+	ExecutingCallback,
+};
 
 enum class PulseCommandType : uint8_t {
 	Add,
@@ -21,12 +37,12 @@ enum class PulseCommandType : uint8_t {
 	Pause,
 	Resume,
 	Restart,
-	Shutdown,
 };
 
 struct PulseCommand {
 	PulseCommandType type = PulseCommandType::Add;
 	PulseTimerId id = kInvalidTimerId;
+	uint64_t generation = 0;
 };
 
 uint64_t pulseNowMs() {
@@ -40,12 +56,18 @@ bool addWouldOverflow(uint32_t left, uint32_t right) {
 bool isActiveState(PulseTimerState state) {
 	return state == PulseTimerState::Running || state == PulseTimerState::Paused;
 }
+
+TickType_t waitTicksForMs(uint32_t milliseconds) {
+	const TickType_t ticks = pdMS_TO_TICKS(milliseconds);
+	return ticks > 0 ? ticks : 1;
+}
 } // namespace
 
 struct PulseTimerRecord {
 	PulseTimerId id = kInvalidTimerId;
 	PulseTimerType type = PulseTimerType::Timeout;
 	PulseTimerState state = PulseTimerState::Running;
+	PulseExecutionState executionState = PulseExecutionState::Idle;
 	PulseCallback callback;
 	PulseCountdownCallback countdownCallback;
 	uint32_t delayMs = 0;
@@ -54,12 +76,42 @@ struct PulseTimerRecord {
 	uint32_t tickMs = 0;
 	uint32_t elapsedMs = 0;
 	uint32_t remainingDelayMs = 0;
+	uint32_t callbackNextDelayMs = 0;
+	uint32_t mutationGeneration = 0;
 	uint64_t nextDueMs = 0;
 };
 
 struct PulseImpl {
+	PulseImpl() : completionEvent(xEventGroupCreate()) {
+	}
+
+	~PulseImpl() {
+		if (completionEvent != nullptr) {
+			vEventGroupDelete(completionEvent);
+		}
+	}
+
+	PulseImpl(const PulseImpl &) = delete;
+	PulseImpl &operator=(const PulseImpl &) = delete;
+
+	bool valid() const {
+		return mutex.valid() && completionEvent != nullptr;
+	}
+
+	void retain() noexcept {
+		referenceCount.fetch_add(1, std::memory_order_relaxed);
+	}
+
+	void release() noexcept {
+		if (referenceCount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+			delete this;
+		}
+	}
+
+	std::atomic<uint32_t> referenceCount{1};
 	PulseConfig config{};
 	PulseMutex mutex;
+	EventGroupHandle_t completionEvent = nullptr;
 	std::unique_ptr<std::shared_ptr<PulseTimerRecord>[]> timers;
 	std::unique_ptr<std::shared_ptr<PulseTimerRecord>[]> activeTimers;
 	uint32_t timerCapacity = 0;
@@ -67,16 +119,40 @@ struct PulseImpl {
 	uint32_t activeTimerCount = 0;
 	QueueHandle_t commandQueue = nullptr;
 	TaskHandle_t taskHandle = nullptr;
-	bool initialized = false;
-	bool stopping = false;
-	bool taskStopped = true;
+	PulseLifecycleState lifecycle = PulseLifecycleState::Uninitialized;
+	uint64_t lifecycleGeneration = 0;
 	bool createdWithCaps = false;
 	PulseStackType actualStackType = PulseStackType::Internal;
 	PulseTimerId nextTimerId = 1;
 	uint32_t executedCallbackCount = 0;
 	uint32_t droppedCommandCount = 0;
 	uint32_t lateCallbackCount = 0;
-	size_t stackHighWaterMarkBytes = 0;
+	size_t finalStackHighWaterMarkBytes = 0;
+
+	bool isCurrentTaskLocked() const {
+		return taskHandle != nullptr && xTaskGetCurrentTaskHandle() == taskHandle;
+	}
+
+	bool isRunningGenerationLocked(uint64_t generation) const {
+		return lifecycle == PulseLifecycleState::Running && lifecycleGeneration == generation;
+	}
+
+	PulseResult unavailableResultLocked() const {
+		if (lifecycle == PulseLifecycleState::Uninitialized) {
+			return PulseResult::failure(PulseStatus::NotInitialized, "pulse is not initialized");
+		}
+		return PulseResult::failure(PulseStatus::Busy, "pulse lifecycle is not running");
+	}
+
+	PulseTimerResult unavailableTimerResultLocked() const {
+		if (lifecycle == PulseLifecycleState::Uninitialized) {
+			return PulseTimerResult::failure(
+			    PulseStatus::NotInitialized,
+			    "pulse is not initialized"
+			);
+		}
+		return PulseTimerResult::failure(PulseStatus::Busy, "pulse lifecycle is not running");
+	}
 
 	std::shared_ptr<PulseTimerRecord> findTimerLocked(PulseTimerId id) {
 		for (uint32_t index = 0; index < timerCount; index++) {
@@ -117,11 +193,8 @@ struct PulseImpl {
 	    PulseTimerType type,
 	    const char *limitMessage
 	) const {
-		if (!initialized || stopping) {
-			return PulseTimerResult::failure(
-			    PulseStatus::NotInitialized,
-			    "pulse is not initialized"
-			);
+		if (lifecycle != PulseLifecycleState::Running) {
+			return unavailableTimerResultLocked();
 		}
 		if (limitReachedLocked(type)) {
 			return PulseTimerResult::failure(PulseStatus::Busy, limitMessage);
@@ -171,12 +244,19 @@ struct PulseImpl {
 		activeTimerCount = writeIndex;
 	}
 
-	void removeRegistryLocked(PulseTimerId id) {
+	std::shared_ptr<PulseTimerRecord> removeRegistryLocked(PulseTimerId id) {
 		removeActiveLocked(id);
+		std::shared_ptr<PulseTimerRecord> removed;
 		uint32_t writeIndex = 0;
 		for (uint32_t readIndex = 0; readIndex < timerCount; readIndex++) {
 			auto &timer = timers[readIndex];
-			if (timer && timer->id != id) {
+			if (timer && timer->id == id) {
+				if (!removed) {
+					removed = timer;
+				}
+				continue;
+			}
+			if (timer) {
 				if (writeIndex != readIndex) {
 					timers[writeIndex] = timer;
 				}
@@ -187,6 +267,7 @@ struct PulseImpl {
 			timers[index].reset();
 		}
 		timerCount = writeIndex;
+		return removed;
 	}
 
 	void insertActiveLocked(const std::shared_ptr<PulseTimerRecord> &timer) {
@@ -217,93 +298,153 @@ struct PulseImpl {
 		);
 	}
 
-	void incrementDroppedCommand() {
-		PulseLock lock(mutex);
-		if (lock) {
-			droppedCommandCount++;
+	void notifyTaskLocked() {
+		if (taskHandle != nullptr) {
+			xTaskNotifyGive(taskHandle);
 		}
 	}
 
-	PulseResult enqueueCommand(PulseCommandType type, PulseTimerId id, TickType_t timeout = 0) {
+	PulseResult requestStopLocked() {
+		if (lifecycle == PulseLifecycleState::Uninitialized ||
+		    lifecycle == PulseLifecycleState::Stopped) {
+			return PulseResult::success("pulse already stopped");
+		}
+		if (lifecycle == PulseLifecycleState::Running) {
+			lifecycle = PulseLifecycleState::Stopping;
+		}
+		notifyTaskLocked();
+		return PulseResult::success("pulse shutdown requested");
+	}
+
+	PulseResult enqueueCommandLocked(PulseCommandType type, PulseTimerId id) {
+		if (lifecycle != PulseLifecycleState::Running) {
+			return unavailableResultLocked();
+		}
+		if (commandQueue == nullptr || taskHandle == nullptr) {
+			return PulseResult::failure(PulseStatus::InternalError, "pulse scheduler is unavailable");
+		}
+
 		PulseCommand command;
 		command.type = type;
 		command.id = id;
+		command.generation = lifecycleGeneration;
 
-		if (commandQueue == nullptr || xQueueSend(commandQueue, &command, timeout) != pdTRUE) {
-			incrementDroppedCommand();
+		if (xQueueSend(commandQueue, &command, 0) != pdTRUE) {
+			droppedCommandCount++;
 			return PulseResult::failure(PulseStatus::QueueFull, "pulse command queue is full");
 		}
+		notifyTaskLocked();
 		return PulseResult::success("command queued");
 	}
 
 	void processCommand(const PulseCommand &command) {
-		const uint64_t nowMs = pulseNowMs();
-		PulseLock lock(mutex);
-		if (!lock) {
-			return;
-		}
-
-		if (command.type == PulseCommandType::Shutdown) {
-			stopping = true;
-			return;
-		}
-
-		auto timer = findTimerLocked(command.id);
-		if (!timer) {
-			return;
-		}
-
-		if (command.type == PulseCommandType::Add) {
-			if (timer->state == PulseTimerState::Running) {
-				insertActiveLocked(timer);
+		std::shared_ptr<PulseTimerRecord> detached;
+		{
+			PulseLock lock(mutex);
+			if (!lock || !isRunningGenerationLocked(command.generation)) {
+				return;
 			}
-			return;
-		}
 
-		if (command.type == PulseCommandType::Clear) {
-			removeRegistryLocked(command.id);
-			return;
-		}
-
-		if (command.type == PulseCommandType::Pause) {
-			if (timer->state == PulseTimerState::Running) {
-				timer->remainingDelayMs =
-				    timer->nextDueMs > nowMs ? static_cast<uint32_t>(timer->nextDueMs - nowMs) : 1;
-				timer->state = PulseTimerState::Paused;
-				removeActiveLocked(timer->id);
+			auto timer = findTimerLocked(command.id);
+			if (!timer) {
+				return;
 			}
-			return;
-		}
 
-		if (command.type == PulseCommandType::Resume) {
-			if (timer->state == PulseTimerState::Paused) {
-				const uint32_t delayMs = timer->remainingDelayMs > 0 ? timer->remainingDelayMs : 1;
-				timer->nextDueMs = nowMs + delayMs;
-				timer->remainingDelayMs = 0;
+			const uint64_t nowMs = pulseNowMs();
+			if (command.type == PulseCommandType::Add) {
+				if (timer->state == PulseTimerState::Running) {
+					insertActiveLocked(timer);
+				}
+			} else if (command.type == PulseCommandType::Clear) {
+				detached = removeRegistryLocked(command.id);
+			} else if (command.type == PulseCommandType::Pause) {
+				if (timer->state == PulseTimerState::Running) {
+					if (timer->executionState == PulseExecutionState::ExecutingCallback &&
+					    (timer->type == PulseTimerType::Interval ||
+					     timer->type == PulseTimerType::Countdown)) {
+						timer->remainingDelayMs =
+						    timer->callbackNextDelayMs > 0 ? timer->callbackNextDelayMs : 1;
+					} else {
+						timer->remainingDelayMs =
+						    timer->nextDueMs > nowMs ?
+						        static_cast<uint32_t>(timer->nextDueMs - nowMs) :
+						        1;
+					}
+					timer->state = PulseTimerState::Paused;
+					timer->mutationGeneration++;
+					removeActiveLocked(timer->id);
+				}
+			} else if (command.type == PulseCommandType::Resume) {
+				if (timer->state == PulseTimerState::Paused) {
+					const uint32_t delayMs =
+					    timer->remainingDelayMs > 0 ? timer->remainingDelayMs : 1;
+					timer->nextDueMs = nowMs + delayMs;
+					timer->remainingDelayMs = 0;
+					timer->state = PulseTimerState::Running;
+					timer->mutationGeneration++;
+					insertActiveLocked(timer);
+				}
+			} else if (command.type == PulseCommandType::Restart) {
 				timer->state = PulseTimerState::Running;
+				timer->remainingDelayMs = 0;
+				timer->mutationGeneration++;
+				if (timer->type == PulseTimerType::Countdown) {
+					timer->elapsedMs = 0;
+					timer->nextDueMs = nowMs + timer->tickMs;
+				} else if (timer->type == PulseTimerType::Interval) {
+					timer->nextDueMs = nowMs + timer->intervalMs;
+				} else {
+					timer->nextDueMs = nowMs + timer->delayMs;
+				}
 				insertActiveLocked(timer);
 			}
-			return;
 		}
+		detached.reset();
+	}
 
-		if (command.type == PulseCommandType::Restart) {
-			timer->state = PulseTimerState::Running;
-			timer->remainingDelayMs = 0;
-			if (timer->type == PulseTimerType::Countdown) {
-				timer->elapsedMs = 0;
-				timer->nextDueMs = nowMs + timer->tickMs;
-			} else if (timer->type == PulseTimerType::Interval) {
-				timer->nextDueMs = nowMs + timer->intervalMs;
-			} else {
-				timer->nextDueMs = nowMs + timer->delayMs;
+	uint32_t queueUsageLocked() const {
+		return commandQueue != nullptr ?
+		           static_cast<uint32_t>(uxQueueMessagesWaiting(commandQueue)) :
+		           0;
+	}
+
+	uint32_t queueUsage() {
+		PulseLock lock(mutex);
+		if (!lock || lifecycle != PulseLifecycleState::Running) {
+			return 0;
+		}
+		return std::min(queueUsageLocked(), config.commandQueueSize);
+	}
+
+	void processQueuedCommandsSnapshot(uint32_t commandCount, uint64_t generation) {
+		const uint32_t boundedCount = std::min(commandCount, config.commandQueueSize);
+		for (uint32_t index = 0; index < boundedCount; index++) {
+			QueueHandle_t queue = nullptr;
+			{
+				PulseLock lock(mutex);
+				if (!lock || !isRunningGenerationLocked(generation)) {
+					return;
+				}
+				queue = commandQueue;
 			}
-			insertActiveLocked(timer);
+			if (queue == nullptr) {
+				return;
+			}
+
+			PulseCommand command;
+			if (xQueueReceive(queue, &command, 0) != pdTRUE) {
+				return;
+			}
+			processCommand(command);
 		}
 	}
 
 	TickType_t nextWaitTicks() {
 		PulseLock lock(mutex);
-		if (!lock || stopping) {
+		if (!lock || lifecycle != PulseLifecycleState::Running) {
+			return 0;
+		}
+		if (queueUsageLocked() > 0) {
 			return 0;
 		}
 		while (activeTimerCount > 0 && !activeTimers[0]) {
@@ -320,25 +461,12 @@ struct PulseImpl {
 		if (remainingMs > UINT32_MAX) {
 			remainingMs = UINT32_MAX;
 		}
-		TickType_t ticks = pdMS_TO_TICKS(static_cast<uint32_t>(remainingMs));
-		return ticks > 0 ? ticks : 1;
-	}
-
-	void processQueuedCommands(TickType_t waitTicks) {
-		PulseCommand command;
-		if (xQueueReceive(commandQueue, &command, waitTicks) != pdTRUE) {
-			return;
-		}
-		processCommand(command);
-
-		while (xQueueReceive(commandQueue, &command, 0) == pdTRUE) {
-			processCommand(command);
-		}
+		return waitTicksForMs(static_cast<uint32_t>(remainingMs));
 	}
 
 	bool takeDueTimer(std::shared_ptr<PulseTimerRecord> &out, uint64_t &dueMs) {
 		PulseLock lock(mutex);
-		if (!lock) {
+		if (!lock || lifecycle != PulseLifecycleState::Running || queueUsageLocked() > 0) {
 			return false;
 		}
 		const uint64_t nowMs = pulseNowMs();
@@ -370,25 +498,30 @@ struct PulseImpl {
 			return;
 		}
 
-		PulseCallback callback;
-		PulseCountdownCallback countdownCallback;
 		PulseCountdownTick tick;
 		bool finishedCountdown = false;
 		bool shouldRun = false;
+		bool terminal = false;
+		uint32_t generationBeforeCallback = 0;
+		uint64_t runGeneration = 0;
 
 		{
 			PulseLock lock(mutex);
-			if (!lock || timer->state != PulseTimerState::Running || !hasTimerLocked(timer->id)) {
+			if (!lock || lifecycle != PulseLifecycleState::Running ||
+			    timer->state != PulseTimerState::Running || !hasTimerLocked(timer->id)) {
 				return;
 			}
 
+			runGeneration = lifecycleGeneration;
+			generationBeforeCallback = timer->mutationGeneration;
 			if (timer->type == PulseTimerType::Timeout) {
-				callback = timer->callback;
-				removeRegistryLocked(timer->id);
-				shouldRun = static_cast<bool>(callback);
+				terminal = true;
+				shouldRun = static_cast<bool>(timer->callback);
+				(void)removeRegistryLocked(timer->id);
 			} else if (timer->type == PulseTimerType::Interval) {
-				callback = timer->callback;
-				shouldRun = static_cast<bool>(callback);
+				timer->executionState = PulseExecutionState::ExecutingCallback;
+				timer->callbackNextDelayMs = timer->intervalMs;
+				shouldRun = static_cast<bool>(timer->callback);
 			} else {
 				const uint32_t remainingBefore =
 				    timer->durationMs > timer->elapsedMs ? timer->durationMs - timer->elapsedMs : 0;
@@ -401,16 +534,43 @@ struct PulseImpl {
 				tick.remainingSeconds = tick.remainingMs / 1000;
 				tick.isFinished = timer->elapsedMs >= timer->durationMs;
 				finishedCountdown = tick.isFinished;
-				countdownCallback = timer->countdownCallback;
-				shouldRun = static_cast<bool>(countdownCallback);
+				terminal = finishedCountdown;
+				shouldRun = static_cast<bool>(timer->countdownCallback);
+				if (finishedCountdown) {
+					(void)removeRegistryLocked(timer->id);
+				} else {
+					timer->executionState = PulseExecutionState::ExecutingCallback;
+					timer->callbackNextDelayMs = std::min(timer->tickMs, tick.remainingMs);
+				}
 			}
 		}
 
 		(void)dueMs;
-		if (callback) {
-			callback();
-		} else if (countdownCallback) {
-			countdownCallback(tick);
+		if (timer->type == PulseTimerType::Countdown) {
+			if (timer->countdownCallback) {
+				timer->countdownCallback(tick);
+			}
+		} else if (timer->callback) {
+			timer->callback();
+		}
+
+		{
+			PulseLock lock(mutex);
+			if (lock && shouldRun) {
+				executedCallbackCount++;
+			}
+		}
+
+		uint32_t queuedAtCallbackCompletion = 0;
+		{
+			PulseLock lock(mutex);
+			if (lock && isRunningGenerationLocked(runGeneration)) {
+				queuedAtCallbackCompletion =
+				    std::min(queueUsageLocked(), config.commandQueueSize);
+			}
+		}
+		if (queuedAtCallbackCompletion > 0) {
+			processQueuedCommandsSnapshot(queuedAtCallbackCompletion, runGeneration);
 		}
 
 		{
@@ -418,62 +578,101 @@ struct PulseImpl {
 			if (!lock) {
 				return;
 			}
-			if (shouldRun) {
-				executedCallbackCount++;
-			}
-
-			if (timer->type == PulseTimerType::Interval) {
-				if (timer->state == PulseTimerState::Running && hasTimerLocked(timer->id)) {
-					timer->nextDueMs = pulseNowMs() + timer->intervalMs;
-					insertActiveLocked(timer);
-				}
+			timer->executionState = PulseExecutionState::Idle;
+			if (!isRunningGenerationLocked(runGeneration) || terminal ||
+			    !hasTimerLocked(timer->id)) {
 				return;
 			}
-
-			if (timer->type == PulseTimerType::Countdown) {
-				if (finishedCountdown) {
-					removeRegistryLocked(timer->id);
-				} else if (timer->state == PulseTimerState::Running && hasTimerLocked(timer->id)) {
-					const uint32_t remainingMs =
-					    timer->durationMs > timer->elapsedMs ? timer->durationMs - timer->elapsedMs : 0;
-					const uint32_t nextDelayMs = std::min(timer->tickMs, remainingMs);
-					timer->nextDueMs = pulseNowMs() + nextDelayMs;
-					insertActiveLocked(timer);
-				}
+			if (timer->state == PulseTimerState::Running &&
+			    timer->mutationGeneration == generationBeforeCallback) {
+				const uint32_t nextDelayMs =
+				    timer->callbackNextDelayMs > 0 ? timer->callbackNextDelayMs : 1;
+				timer->nextDueMs = pulseNowMs() + nextDelayMs;
+				insertActiveLocked(timer);
 			}
 		}
 	}
 
-	void processDueTimers() {
-		while (true) {
-			std::shared_ptr<PulseTimerRecord> timer;
-			uint64_t dueMs = 0;
-			if (!takeDueTimer(timer, dueMs)) {
-				return;
-			}
-			executeTimer(timer, dueMs);
-		}
+	bool running() {
+		PulseLock lock(mutex);
+		return lock && lifecycle == PulseLifecycleState::Running;
+	}
+
+	uint64_t currentGeneration() {
+		PulseLock lock(mutex);
+		return lock ? lifecycleGeneration : 0;
 	}
 
 	void taskLoop() {
-		while (true) {
-			processQueuedCommands(nextWaitTicks());
-			{
-				PulseLock lock(mutex);
-				if (lock && stopping) {
-					break;
-				}
+		while (running()) {
+			const uint64_t generation = currentGeneration();
+			const uint32_t pendingCommands = queueUsage();
+			if (pendingCommands > 0) {
+				processQueuedCommandsSnapshot(pendingCommands, generation);
+				continue;
 			}
-			processDueTimers();
+
+			std::shared_ptr<PulseTimerRecord> timer;
+			uint64_t dueMs = 0;
+			if (takeDueTimer(timer, dueMs)) {
+				executeTimer(timer, dueMs);
+				continue;
+			}
+
+			const TickType_t waitTicks = nextWaitTicks();
+			if (waitTicks == 0) {
+				continue;
+			}
+			ulTaskNotifyTake(pdTRUE, waitTicks);
 		}
 	}
 
-	void markTaskStopped() {
-		PulseLock lock(mutex);
-		if (lock) {
-			stackHighWaterMarkBytes = pulse_task_support::currentStackHighWaterMarkBytes();
-			taskHandle = nullptr;
-			taskStopped = true;
+	void quiesceAndDeleteSelf() {
+		std::unique_ptr<std::shared_ptr<PulseTimerRecord>[]> detachedTimers;
+		std::unique_ptr<std::shared_ptr<PulseTimerRecord>[]> detachedActiveTimers;
+		QueueHandle_t detachedQueue = nullptr;
+		bool withCaps = false;
+		EventGroupHandle_t completion = nullptr;
+
+		{
+			PulseLock lock(mutex);
+			if (lock) {
+				detachedTimers = std::move(timers);
+				detachedActiveTimers = std::move(activeTimers);
+				detachedQueue = commandQueue;
+				commandQueue = nullptr;
+				timerCapacity = 0;
+				timerCount = 0;
+				activeTimerCount = 0;
+				nextTimerId = 1;
+				withCaps = createdWithCaps;
+				completion = completionEvent;
+			}
+		}
+
+		detachedActiveTimers.reset();
+		detachedTimers.reset();
+		if (detachedQueue != nullptr) {
+			vQueueDelete(detachedQueue);
+		}
+
+		const size_t finalStack = pulse_task_support::currentStackHighWaterMarkBytes();
+		{
+			PulseLock lock(mutex);
+			if (lock) {
+				finalStackHighWaterMarkBytes = finalStack;
+				taskHandle = nullptr;
+				lifecycle = PulseLifecycleState::Stopped;
+			}
+		}
+		if (completion != nullptr) {
+			xEventGroupSetBits(completion, kCompletionBit);
+		}
+
+		release();
+		pulse_task_support::deleteCurrentTask(withCaps);
+		for (;;) {
+			vTaskDelay(portMAX_DELAY);
 		}
 	}
 
@@ -484,11 +683,115 @@ struct PulseImpl {
 			return;
 		}
 		impl->taskLoop();
-		const bool withCaps = impl->createdWithCaps;
-		impl->markTaskStopped();
-		pulse_task_support::deleteCurrentTask(withCaps);
+		impl->quiesceAndDeleteSelf();
 	}
 };
+
+namespace {
+PulseResult endImpl(PulseImpl *impl, uint32_t timeoutMs, bool waitForever) {
+	if (impl == nullptr) {
+		return PulseResult::success("pulse not initialized");
+	}
+
+	uint64_t targetGeneration = 0;
+	{
+		PulseLock lock(impl->mutex);
+		if (!lock) {
+			return PulseResult::failure(PulseStatus::InternalError, "failed to lock pulse");
+		}
+		if (impl->lifecycle == PulseLifecycleState::Uninitialized) {
+			return PulseResult::success("pulse not initialized");
+		}
+		if (impl->isCurrentTaskLocked()) {
+			return PulseResult::failure(PulseStatus::Busy, "end cannot wait from the pulse task");
+		}
+		targetGeneration = impl->lifecycleGeneration;
+		if (impl->lifecycle == PulseLifecycleState::Running) {
+			impl->requestStopLocked();
+		}
+	}
+
+	const uint64_t startMs = pulseNowMs();
+	while (true) {
+		{
+			PulseLock lock(impl->mutex);
+			if (!lock) {
+				return PulseResult::failure(PulseStatus::InternalError, "failed to lock pulse");
+			}
+			if (impl->lifecycleGeneration != targetGeneration) {
+				return PulseResult::success("target pulse generation already ended");
+			}
+			if (impl->lifecycle == PulseLifecycleState::Uninitialized) {
+				return PulseResult::success("pulse ended");
+			}
+			if (impl->lifecycle == PulseLifecycleState::Stopped) {
+				impl->lifecycle = PulseLifecycleState::Uninitialized;
+				return PulseResult::success("pulse ended");
+			}
+			if (impl->lifecycle != PulseLifecycleState::Stopping) {
+				return PulseResult::failure(
+				    PulseStatus::InternalError,
+				    "unexpected pulse lifecycle state"
+				);
+			}
+		}
+
+		if (!waitForever && pulseNowMs() - startMs >= timeoutMs) {
+			return PulseResult::failure(PulseStatus::Timeout, "pulse end timed out");
+		}
+
+		uint32_t waitMs = kWaitPollMs;
+		if (!waitForever) {
+			const uint64_t elapsed = pulseNowMs() - startMs;
+			const uint64_t remaining = timeoutMs > elapsed ? timeoutMs - elapsed : 0;
+			if (remaining == 0) {
+				return PulseResult::failure(PulseStatus::Timeout, "pulse end timed out");
+			}
+			waitMs = static_cast<uint32_t>(std::min<uint64_t>(remaining, kWaitPollMs));
+		}
+		xEventGroupWaitBits(
+		    impl->completionEvent,
+		    kCompletionBit,
+		    pdFALSE,
+		    pdFALSE,
+		    waitTicksForMs(waitMs)
+		);
+	}
+}
+
+PulseResult queueControl(
+    PulseImpl *impl,
+    PulseTimerId id,
+    PulseCommandType commandType,
+    bool enforceType,
+    PulseTimerType expectedType
+) {
+	if (impl == nullptr) {
+		return PulseResult::failure(PulseStatus::NotInitialized, "pulse is not initialized");
+	}
+	PulseLock lock(impl->mutex);
+	if (!lock) {
+		return PulseResult::failure(PulseStatus::InternalError, "failed to lock pulse");
+	}
+	if (impl->lifecycle != PulseLifecycleState::Running) {
+		return impl->unavailableResultLocked();
+	}
+	auto timer = impl->findTimerLocked(id);
+	if (!timer) {
+		return PulseResult::failure(PulseStatus::TimerNotFound, "timer not found");
+	}
+	if (enforceType && timer->type != expectedType) {
+		if (expectedType == PulseTimerType::Timeout) {
+			return PulseResult::failure(PulseStatus::InvalidArgument, "timer is not a timeout");
+		}
+		if (expectedType == PulseTimerType::Interval) {
+			return PulseResult::failure(PulseStatus::InvalidArgument, "timer is not an interval");
+		}
+		return PulseResult::failure(PulseStatus::InvalidArgument, "timer is not a countdown");
+	}
+	return impl->enqueueCommandLocked(commandType, id);
+}
+} // namespace
 
 PulseResult PulseResult::success(const char *message) {
 	PulseResult result;
@@ -528,11 +831,37 @@ PulseTimerResult PulseTimerResult::failure(
 	return result;
 }
 
-Pulse::Pulse() : _impl(std::make_unique<PulseImpl>()) {
-}
-
 Pulse::~Pulse() {
-	end(2000);
+	PulseImpl *impl = _impl.load(std::memory_order_acquire);
+	if (impl == nullptr) {
+		return;
+	}
+
+	bool selfDestruction = false;
+	{
+		PulseLock lock(impl->mutex);
+		if (lock) {
+			selfDestruction = impl->isCurrentTaskLocked();
+			if (selfDestruction) {
+				impl->requestStopLocked();
+			}
+		}
+	}
+
+	if (!selfDestruction) {
+		while (true) {
+			PulseResult result = endImpl(impl, 0, true);
+			if (result) {
+				break;
+			}
+			vTaskDelay(1);
+		}
+	}
+
+	PulseImpl *owned = _impl.exchange(nullptr, std::memory_order_acq_rel);
+	if (owned != nullptr) {
+		owned->release();
+	}
 }
 
 PulseResult Pulse::init(const PulseConfig &config) {
@@ -558,6 +887,32 @@ PulseResult Pulse::init(const PulseConfig &config) {
 		);
 	}
 
+	PulseImpl *impl = _impl.load(std::memory_order_acquire);
+	if (impl == nullptr) {
+		PulseImpl *candidate = new (std::nothrow) PulseImpl();
+		if (candidate == nullptr || !candidate->valid()) {
+			if (candidate != nullptr) {
+				candidate->release();
+			}
+			return PulseResult::failure(
+			    PulseStatus::OutOfMemory,
+			    "failed to allocate pulse implementation"
+			);
+		}
+		PulseImpl *expected = nullptr;
+		if (_impl.compare_exchange_strong(
+		        expected,
+		        candidate,
+		        std::memory_order_acq_rel,
+		        std::memory_order_acquire
+		    )) {
+			impl = candidate;
+		} else {
+			candidate->release();
+			impl = expected;
+		}
+	}
+
 	bool usePsramStack = false;
 	PulseStackType actualStackType = PulseStackType::Internal;
 	if (config.stackType == PulseStackType::Psram) {
@@ -576,64 +931,56 @@ PulseResult Pulse::init(const PulseConfig &config) {
 		actualStackType = PulseStackType::Psram;
 	}
 
-	{
-		PulseLock lock(_impl->mutex);
-		if (!lock) {
-			return PulseResult::failure(PulseStatus::InternalError, "failed to lock pulse");
-		}
-		if (_impl->initialized) {
-			return PulseResult::failure(PulseStatus::AlreadyInitialized, "pulse already initialized");
-		}
-		_impl->config = config;
-		_impl->actualStackType = actualStackType;
-		_impl->stopping = false;
-		_impl->taskStopped = false;
-		_impl->createdWithCaps = false;
-		_impl->executedCallbackCount = 0;
-		_impl->droppedCommandCount = 0;
-		_impl->lateCallbackCount = 0;
-		_impl->stackHighWaterMarkBytes = 0;
-		_impl->nextTimerId = 1;
-		_impl->timerCapacity = timerCapacity;
-		_impl->timerCount = 0;
-		_impl->activeTimerCount = 0;
-		_impl->timers.reset(
-		    new (std::nothrow) std::shared_ptr<PulseTimerRecord>[timerCapacity]
-		);
-		_impl->activeTimers.reset(
-		    new (std::nothrow) std::shared_ptr<PulseTimerRecord>[timerCapacity]
-		);
-		if (!_impl->timers || !_impl->activeTimers) {
-			_impl->timers.reset();
-			_impl->activeTimers.reset();
-			_impl->timerCapacity = 0;
-			_impl->taskStopped = true;
-			return PulseResult::failure(
-			    PulseStatus::OutOfMemory,
-			    "failed to allocate timer storage"
-			);
-		}
+	PulseLock lock(impl->mutex);
+	if (!lock) {
+		return PulseResult::failure(PulseStatus::InternalError, "failed to lock pulse");
+	}
+	if (impl->lifecycle == PulseLifecycleState::Running) {
+		return PulseResult::failure(PulseStatus::AlreadyInitialized, "pulse already initialized");
+	}
+	if (impl->lifecycle != PulseLifecycleState::Uninitialized) {
+		return PulseResult::failure(PulseStatus::Busy, "pulse lifecycle is not ready for init");
 	}
 
-	_impl->commandQueue = xQueueCreate(config.commandQueueSize, sizeof(PulseCommand));
-	if (_impl->commandQueue == nullptr) {
-		PulseLock lock(_impl->mutex);
-		if (lock) {
-			_impl->taskStopped = true;
-			_impl->timers.reset();
-			_impl->activeTimers.reset();
-			_impl->timerCapacity = 0;
-		}
+	impl->config = config;
+	impl->actualStackType = actualStackType;
+	impl->createdWithCaps = false;
+	impl->executedCallbackCount = 0;
+	impl->droppedCommandCount = 0;
+	impl->lateCallbackCount = 0;
+	impl->finalStackHighWaterMarkBytes = 0;
+	impl->nextTimerId = 1;
+	impl->timerCapacity = timerCapacity;
+	impl->timerCount = 0;
+	impl->activeTimerCount = 0;
+	impl->timers.reset(new (std::nothrow) std::shared_ptr<PulseTimerRecord>[timerCapacity]);
+	impl->activeTimers.reset(
+	    new (std::nothrow) std::shared_ptr<PulseTimerRecord>[timerCapacity]
+	);
+	if (!impl->timers || !impl->activeTimers) {
+		impl->timers.reset();
+		impl->activeTimers.reset();
+		impl->timerCapacity = 0;
+		return PulseResult::failure(PulseStatus::OutOfMemory, "failed to allocate timer storage");
+	}
+
+	impl->commandQueue = xQueueCreate(config.commandQueueSize, sizeof(PulseCommand));
+	if (impl->commandQueue == nullptr) {
+		impl->timers.reset();
+		impl->activeTimers.reset();
+		impl->timerCapacity = 0;
 		return PulseResult::failure(PulseStatus::QueueCreateFailed, "failed to create command queue");
 	}
 
+	xEventGroupClearBits(impl->completionEvent, kCompletionBit);
+	impl->retain();
 	TaskHandle_t handle = nullptr;
 	bool createdWithCaps = false;
 	const BaseType_t created = pulse_task_support::createTask(
 	    &PulseImpl::taskEntry,
 	    config.taskName != nullptr ? config.taskName : "pulse-task",
 	    config.stackSizeBytes,
-	    _impl.get(),
+	    impl,
 	    config.priority,
 	    &handle,
 	    config.coreId,
@@ -641,97 +988,27 @@ PulseResult Pulse::init(const PulseConfig &config) {
 	    createdWithCaps
 	);
 	if (created != pdPASS || handle == nullptr) {
-		vQueueDelete(_impl->commandQueue);
-		_impl->commandQueue = nullptr;
-		PulseLock lock(_impl->mutex);
-		if (lock) {
-			_impl->taskStopped = true;
-			_impl->timers.reset();
-			_impl->activeTimers.reset();
-			_impl->timerCapacity = 0;
-		}
+		impl->release();
+		vQueueDelete(impl->commandQueue);
+		impl->commandQueue = nullptr;
+		impl->timers.reset();
+		impl->activeTimers.reset();
+		impl->timerCapacity = 0;
 		return PulseResult::failure(PulseStatus::TaskCreateFailed, "failed to create pulse task");
 	}
 
-	{
-		PulseLock lock(_impl->mutex);
-		if (lock) {
-			_impl->taskHandle = handle;
-			_impl->createdWithCaps = createdWithCaps;
-			_impl->initialized = true;
-		}
+	impl->lifecycleGeneration++;
+	if (impl->lifecycleGeneration == 0) {
+		impl->lifecycleGeneration++;
 	}
+	impl->taskHandle = handle;
+	impl->createdWithCaps = createdWithCaps;
+	impl->lifecycle = PulseLifecycleState::Running;
 	return PulseResult::success("pulse initialized");
 }
 
 PulseResult Pulse::end(uint32_t timeoutMs) {
-	QueueHandle_t queue = nullptr;
-	{
-		PulseLock lock(_impl->mutex);
-		if (!lock) {
-			return PulseResult::failure(PulseStatus::InternalError, "failed to lock pulse");
-		}
-		if (!_impl->initialized) {
-			return PulseResult::success("pulse not initialized");
-		}
-		_impl->stopping = true;
-		queue = _impl->commandQueue;
-	}
-
-	if (queue != nullptr) {
-		PulseResult shutdownResult =
-		    _impl->enqueueCommand(PulseCommandType::Shutdown, kInvalidTimerId, pdMS_TO_TICKS(timeoutMs));
-		if (!shutdownResult) {
-			if (shutdownResult.status == PulseStatus::QueueFull) {
-				return PulseResult::failure(PulseStatus::Timeout, "pulse end timed out");
-			}
-			return shutdownResult;
-		}
-	}
-
-	const uint64_t startMs = pulseNowMs();
-	while (true) {
-		bool stopped = false;
-		{
-			PulseLock lock(_impl->mutex);
-			if (lock) {
-				stopped = _impl->taskStopped || _impl->taskHandle == nullptr;
-			}
-		}
-		if (stopped) {
-			break;
-		}
-		if (pulseNowMs() - startMs >= timeoutMs) {
-			return PulseResult::failure(PulseStatus::Timeout, "pulse end timed out");
-		}
-		vTaskDelay(pdMS_TO_TICKS(kWaitPollMs));
-	}
-
-	{
-		PulseLock lock(_impl->mutex);
-		if (lock) {
-			for (uint32_t index = 0; index < _impl->timerCount; index++) {
-				_impl->timers[index].reset();
-			}
-			for (uint32_t index = 0; index < _impl->activeTimerCount; index++) {
-				_impl->activeTimers[index].reset();
-			}
-			_impl->timerCount = 0;
-			_impl->activeTimerCount = 0;
-			_impl->timerCapacity = 0;
-			_impl->timers.reset();
-			_impl->activeTimers.reset();
-			_impl->initialized = false;
-			_impl->stopping = false;
-			_impl->taskStopped = true;
-			_impl->nextTimerId = 1;
-		}
-	}
-	if (_impl->commandQueue != nullptr) {
-		vQueueDelete(_impl->commandQueue);
-		_impl->commandQueue = nullptr;
-	}
-	return PulseResult::success("pulse ended");
+	return endImpl(_impl.load(std::memory_order_acquire), timeoutMs, false);
 }
 
 PulseTimerResult Pulse::setTimeout(PulseCallback callback, uint32_t delayMs) {
@@ -741,17 +1018,9 @@ PulseTimerResult Pulse::setTimeout(PulseCallback callback, uint32_t delayMs) {
 	if (delayMs == 0) {
 		return PulseTimerResult::failure(PulseStatus::InvalidArgument, "delay is required");
 	}
-
-	{
-		PulseLock lock(_impl->mutex);
-		if (!lock) {
-			return PulseTimerResult::failure(PulseStatus::InternalError, "failed to lock pulse");
-		}
-		PulseTimerResult preflight =
-		    _impl->validateTimerCreateLocked(PulseTimerType::Timeout, "timeout limit reached");
-		if (!preflight) {
-			return preflight;
-		}
+	PulseImpl *impl = _impl.load(std::memory_order_acquire);
+	if (impl == nullptr) {
+		return PulseTimerResult::failure(PulseStatus::NotInitialized, "pulse is not initialized");
 	}
 
 	PulseTimerRecord *rawTimer = new (std::nothrow) PulseTimerRecord();
@@ -759,36 +1028,29 @@ PulseTimerResult Pulse::setTimeout(PulseCallback callback, uint32_t delayMs) {
 		return PulseTimerResult::failure(PulseStatus::OutOfMemory, "failed to allocate timer");
 	}
 	std::shared_ptr<PulseTimerRecord> timer(rawTimer);
+	timer->callback = std::move(callback);
 
-	{
-		PulseLock lock(_impl->mutex);
-		if (!lock) {
-			return PulseTimerResult::failure(PulseStatus::InternalError, "failed to lock pulse");
-		}
-		PulseTimerResult preflight =
-		    _impl->validateTimerCreateLocked(PulseTimerType::Timeout, "timeout limit reached");
-		if (!preflight) {
-			return preflight;
-		}
-		if (!_impl->allocateTimerIdLocked(timer->id)) {
-			return PulseTimerResult::failure(PulseStatus::InternalError, "timer id exhausted");
-		}
-		timer->type = PulseTimerType::Timeout;
-		timer->state = PulseTimerState::Running;
-		timer->callback = callback;
-		timer->delayMs = delayMs;
-		timer->nextDueMs = pulseNowMs() + delayMs;
-		if (!_impl->addRegistryLocked(timer)) {
-			return PulseTimerResult::failure(PulseStatus::Busy, "timer storage is full");
-		}
+	PulseLock lock(impl->mutex);
+	if (!lock) {
+		return PulseTimerResult::failure(PulseStatus::InternalError, "failed to lock pulse");
 	}
-
-	PulseResult queued = _impl->enqueueCommand(PulseCommandType::Add, timer->id);
+	PulseTimerResult preflight =
+	    impl->validateTimerCreateLocked(PulseTimerType::Timeout, "timeout limit reached");
+	if (!preflight) {
+		return preflight;
+	}
+	if (!impl->allocateTimerIdLocked(timer->id)) {
+		return PulseTimerResult::failure(PulseStatus::InternalError, "timer id exhausted");
+	}
+	timer->type = PulseTimerType::Timeout;
+	timer->delayMs = delayMs;
+	timer->nextDueMs = pulseNowMs() + delayMs;
+	if (!impl->addRegistryLocked(timer)) {
+		return PulseTimerResult::failure(PulseStatus::Busy, "timer storage is full");
+	}
+	PulseResult queued = impl->enqueueCommandLocked(PulseCommandType::Add, timer->id);
 	if (!queued) {
-		PulseLock lock(_impl->mutex);
-		if (lock) {
-			_impl->removeRegistryLocked(timer->id);
-		}
+		(void)impl->removeRegistryLocked(timer->id);
 		return PulseTimerResult::failure(queued.status, queued.message, timer->id);
 	}
 	return PulseTimerResult::success(timer->id, "timeout scheduled");
@@ -801,17 +1063,9 @@ PulseTimerResult Pulse::setInterval(PulseCallback callback, uint32_t intervalMs)
 	if (intervalMs == 0) {
 		return PulseTimerResult::failure(PulseStatus::InvalidArgument, "interval is required");
 	}
-
-	{
-		PulseLock lock(_impl->mutex);
-		if (!lock) {
-			return PulseTimerResult::failure(PulseStatus::InternalError, "failed to lock pulse");
-		}
-		PulseTimerResult preflight =
-		    _impl->validateTimerCreateLocked(PulseTimerType::Interval, "interval limit reached");
-		if (!preflight) {
-			return preflight;
-		}
+	PulseImpl *impl = _impl.load(std::memory_order_acquire);
+	if (impl == nullptr) {
+		return PulseTimerResult::failure(PulseStatus::NotInitialized, "pulse is not initialized");
 	}
 
 	PulseTimerRecord *rawTimer = new (std::nothrow) PulseTimerRecord();
@@ -819,36 +1073,29 @@ PulseTimerResult Pulse::setInterval(PulseCallback callback, uint32_t intervalMs)
 		return PulseTimerResult::failure(PulseStatus::OutOfMemory, "failed to allocate timer");
 	}
 	std::shared_ptr<PulseTimerRecord> timer(rawTimer);
+	timer->callback = std::move(callback);
 
-	{
-		PulseLock lock(_impl->mutex);
-		if (!lock) {
-			return PulseTimerResult::failure(PulseStatus::InternalError, "failed to lock pulse");
-		}
-		PulseTimerResult preflight =
-		    _impl->validateTimerCreateLocked(PulseTimerType::Interval, "interval limit reached");
-		if (!preflight) {
-			return preflight;
-		}
-		if (!_impl->allocateTimerIdLocked(timer->id)) {
-			return PulseTimerResult::failure(PulseStatus::InternalError, "timer id exhausted");
-		}
-		timer->type = PulseTimerType::Interval;
-		timer->state = PulseTimerState::Running;
-		timer->callback = callback;
-		timer->intervalMs = intervalMs;
-		timer->nextDueMs = pulseNowMs() + intervalMs;
-		if (!_impl->addRegistryLocked(timer)) {
-			return PulseTimerResult::failure(PulseStatus::Busy, "timer storage is full");
-		}
+	PulseLock lock(impl->mutex);
+	if (!lock) {
+		return PulseTimerResult::failure(PulseStatus::InternalError, "failed to lock pulse");
 	}
-
-	PulseResult queued = _impl->enqueueCommand(PulseCommandType::Add, timer->id);
+	PulseTimerResult preflight =
+	    impl->validateTimerCreateLocked(PulseTimerType::Interval, "interval limit reached");
+	if (!preflight) {
+		return preflight;
+	}
+	if (!impl->allocateTimerIdLocked(timer->id)) {
+		return PulseTimerResult::failure(PulseStatus::InternalError, "timer id exhausted");
+	}
+	timer->type = PulseTimerType::Interval;
+	timer->intervalMs = intervalMs;
+	timer->nextDueMs = pulseNowMs() + intervalMs;
+	if (!impl->addRegistryLocked(timer)) {
+		return PulseTimerResult::failure(PulseStatus::Busy, "timer storage is full");
+	}
+	PulseResult queued = impl->enqueueCommandLocked(PulseCommandType::Add, timer->id);
 	if (!queued) {
-		PulseLock lock(_impl->mutex);
-		if (lock) {
-			_impl->removeRegistryLocked(timer->id);
-		}
+		(void)impl->removeRegistryLocked(timer->id);
 		return PulseTimerResult::failure(queued.status, queued.message, timer->id);
 	}
 	return PulseTimerResult::success(timer->id, "interval scheduled");
@@ -873,17 +1120,9 @@ PulseTimerResult Pulse::setCountdown(
 		    "tick must be less than or equal to duration"
 		);
 	}
-
-	{
-		PulseLock lock(_impl->mutex);
-		if (!lock) {
-			return PulseTimerResult::failure(PulseStatus::InternalError, "failed to lock pulse");
-		}
-		PulseTimerResult preflight =
-		    _impl->validateTimerCreateLocked(PulseTimerType::Countdown, "countdown limit reached");
-		if (!preflight) {
-			return preflight;
-		}
+	PulseImpl *impl = _impl.load(std::memory_order_acquire);
+	if (impl == nullptr) {
+		return PulseTimerResult::failure(PulseStatus::NotInitialized, "pulse is not initialized");
 	}
 
 	PulseTimerRecord *rawTimer = new (std::nothrow) PulseTimerRecord();
@@ -891,218 +1130,160 @@ PulseTimerResult Pulse::setCountdown(
 		return PulseTimerResult::failure(PulseStatus::OutOfMemory, "failed to allocate timer");
 	}
 	std::shared_ptr<PulseTimerRecord> timer(rawTimer);
+	timer->countdownCallback = std::move(callback);
 
-	{
-		PulseLock lock(_impl->mutex);
-		if (!lock) {
-			return PulseTimerResult::failure(PulseStatus::InternalError, "failed to lock pulse");
-		}
-		PulseTimerResult preflight =
-		    _impl->validateTimerCreateLocked(PulseTimerType::Countdown, "countdown limit reached");
-		if (!preflight) {
-			return preflight;
-		}
-		if (!_impl->allocateTimerIdLocked(timer->id)) {
-			return PulseTimerResult::failure(PulseStatus::InternalError, "timer id exhausted");
-		}
-		timer->type = PulseTimerType::Countdown;
-		timer->state = PulseTimerState::Running;
-		timer->countdownCallback = callback;
-		timer->durationMs = config.durationMs;
-		timer->tickMs = config.tickMs;
-		timer->elapsedMs = 0;
-		timer->nextDueMs = pulseNowMs() + config.tickMs;
-		if (!_impl->addRegistryLocked(timer)) {
-			return PulseTimerResult::failure(PulseStatus::Busy, "timer storage is full");
-		}
+	PulseLock lock(impl->mutex);
+	if (!lock) {
+		return PulseTimerResult::failure(PulseStatus::InternalError, "failed to lock pulse");
 	}
-
-	PulseResult queued = _impl->enqueueCommand(PulseCommandType::Add, timer->id);
+	PulseTimerResult preflight =
+	    impl->validateTimerCreateLocked(PulseTimerType::Countdown, "countdown limit reached");
+	if (!preflight) {
+		return preflight;
+	}
+	if (!impl->allocateTimerIdLocked(timer->id)) {
+		return PulseTimerResult::failure(PulseStatus::InternalError, "timer id exhausted");
+	}
+	timer->type = PulseTimerType::Countdown;
+	timer->durationMs = config.durationMs;
+	timer->tickMs = config.tickMs;
+	timer->nextDueMs = pulseNowMs() + config.tickMs;
+	if (!impl->addRegistryLocked(timer)) {
+		return PulseTimerResult::failure(PulseStatus::Busy, "timer storage is full");
+	}
+	PulseResult queued = impl->enqueueCommandLocked(PulseCommandType::Add, timer->id);
 	if (!queued) {
-		PulseLock lock(_impl->mutex);
-		if (lock) {
-			_impl->removeRegistryLocked(timer->id);
-		}
+		(void)impl->removeRegistryLocked(timer->id);
 		return PulseTimerResult::failure(queued.status, queued.message, timer->id);
 	}
 	return PulseTimerResult::success(timer->id, "countdown scheduled");
 }
 
 PulseResult Pulse::clear(PulseTimerId id) {
-	{
-		PulseLock lock(_impl->mutex);
-		if (!lock) {
-			return PulseResult::failure(PulseStatus::InternalError, "failed to lock pulse");
-		}
-		if (!_impl->initialized || _impl->stopping) {
-			return PulseResult::failure(PulseStatus::NotInitialized, "pulse is not initialized");
-		}
-		if (!_impl->hasTimerLocked(id)) {
-			return PulseResult::failure(PulseStatus::TimerNotFound, "timer not found");
-		}
-	}
-	return _impl->enqueueCommand(PulseCommandType::Clear, id);
+	return queueControl(
+	    _impl.load(std::memory_order_acquire),
+	    id,
+	    PulseCommandType::Clear,
+	    false,
+	    PulseTimerType::Timeout
+	);
 }
 
 PulseResult Pulse::clearTimeout(PulseTimerId id) {
-	{
-		PulseLock lock(_impl->mutex);
-		if (!lock) {
-			return PulseResult::failure(PulseStatus::InternalError, "failed to lock pulse");
-		}
-		if (!_impl->initialized || _impl->stopping) {
-			return PulseResult::failure(PulseStatus::NotInitialized, "pulse is not initialized");
-		}
-		auto timer = _impl->findTimerLocked(id);
-		if (!timer) {
-			return PulseResult::failure(PulseStatus::TimerNotFound, "timer not found");
-		}
-		if (timer->type != PulseTimerType::Timeout) {
-			return PulseResult::failure(PulseStatus::InvalidArgument, "timer is not a timeout");
-		}
-	}
-	return clear(id);
+	return queueControl(
+	    _impl.load(std::memory_order_acquire),
+	    id,
+	    PulseCommandType::Clear,
+	    true,
+	    PulseTimerType::Timeout
+	);
 }
 
 PulseResult Pulse::clearInterval(PulseTimerId id) {
-	{
-		PulseLock lock(_impl->mutex);
-		if (!lock) {
-			return PulseResult::failure(PulseStatus::InternalError, "failed to lock pulse");
-		}
-		if (!_impl->initialized || _impl->stopping) {
-			return PulseResult::failure(PulseStatus::NotInitialized, "pulse is not initialized");
-		}
-		auto timer = _impl->findTimerLocked(id);
-		if (!timer) {
-			return PulseResult::failure(PulseStatus::TimerNotFound, "timer not found");
-		}
-		if (timer->type != PulseTimerType::Interval) {
-			return PulseResult::failure(PulseStatus::InvalidArgument, "timer is not an interval");
-		}
-	}
-	return clear(id);
+	return queueControl(
+	    _impl.load(std::memory_order_acquire),
+	    id,
+	    PulseCommandType::Clear,
+	    true,
+	    PulseTimerType::Interval
+	);
 }
 
 PulseResult Pulse::clearCountdown(PulseTimerId id) {
-	{
-		PulseLock lock(_impl->mutex);
-		if (!lock) {
-			return PulseResult::failure(PulseStatus::InternalError, "failed to lock pulse");
-		}
-		if (!_impl->initialized || _impl->stopping) {
-			return PulseResult::failure(PulseStatus::NotInitialized, "pulse is not initialized");
-		}
-		auto timer = _impl->findTimerLocked(id);
-		if (!timer) {
-			return PulseResult::failure(PulseStatus::TimerNotFound, "timer not found");
-		}
-		if (timer->type != PulseTimerType::Countdown) {
-			return PulseResult::failure(PulseStatus::InvalidArgument, "timer is not a countdown");
-		}
-	}
-	return clear(id);
+	return queueControl(
+	    _impl.load(std::memory_order_acquire),
+	    id,
+	    PulseCommandType::Clear,
+	    true,
+	    PulseTimerType::Countdown
+	);
 }
 
 PulseResult Pulse::pause(PulseTimerId id) {
-	{
-		PulseLock lock(_impl->mutex);
-		if (!lock) {
-			return PulseResult::failure(PulseStatus::InternalError, "failed to lock pulse");
-		}
-		if (!_impl->initialized || _impl->stopping) {
-			return PulseResult::failure(PulseStatus::NotInitialized, "pulse is not initialized");
-		}
-		if (!_impl->hasTimerLocked(id)) {
-			return PulseResult::failure(PulseStatus::TimerNotFound, "timer not found");
-		}
-	}
-	return _impl->enqueueCommand(PulseCommandType::Pause, id);
+	return queueControl(
+	    _impl.load(std::memory_order_acquire),
+	    id,
+	    PulseCommandType::Pause,
+	    false,
+	    PulseTimerType::Timeout
+	);
 }
 
 PulseResult Pulse::resume(PulseTimerId id) {
-	{
-		PulseLock lock(_impl->mutex);
-		if (!lock) {
-			return PulseResult::failure(PulseStatus::InternalError, "failed to lock pulse");
-		}
-		if (!_impl->initialized || _impl->stopping) {
-			return PulseResult::failure(PulseStatus::NotInitialized, "pulse is not initialized");
-		}
-		if (!_impl->hasTimerLocked(id)) {
-			return PulseResult::failure(PulseStatus::TimerNotFound, "timer not found");
-		}
-	}
-	return _impl->enqueueCommand(PulseCommandType::Resume, id);
+	return queueControl(
+	    _impl.load(std::memory_order_acquire),
+	    id,
+	    PulseCommandType::Resume,
+	    false,
+	    PulseTimerType::Timeout
+	);
 }
 
 PulseResult Pulse::restart(PulseTimerId id) {
-	{
-		PulseLock lock(_impl->mutex);
-		if (!lock) {
-			return PulseResult::failure(PulseStatus::InternalError, "failed to lock pulse");
-		}
-		if (!_impl->initialized || _impl->stopping) {
-			return PulseResult::failure(PulseStatus::NotInitialized, "pulse is not initialized");
-		}
-		if (!_impl->hasTimerLocked(id)) {
-			return PulseResult::failure(PulseStatus::TimerNotFound, "timer not found");
-		}
-	}
-	return _impl->enqueueCommand(PulseCommandType::Restart, id);
+	return queueControl(
+	    _impl.load(std::memory_order_acquire),
+	    id,
+	    PulseCommandType::Restart,
+	    false,
+	    PulseTimerType::Timeout
+	);
 }
 
 PulseTimerState Pulse::getState(PulseTimerId id) {
-	PulseLock lock(_impl->mutex);
-	if (!lock) {
+	PulseImpl *impl = _impl.load(std::memory_order_acquire);
+	if (impl == nullptr) {
 		return PulseTimerState::NotFound;
 	}
-	auto timer = _impl->findTimerLocked(id);
+	PulseLock lock(impl->mutex);
+	if (!lock || impl->lifecycle == PulseLifecycleState::Stopped ||
+	    impl->lifecycle == PulseLifecycleState::Uninitialized) {
+		return PulseTimerState::NotFound;
+	}
+	auto timer = impl->findTimerLocked(id);
 	return timer ? timer->state : PulseTimerState::NotFound;
 }
 
 PulseDiag Pulse::getDiagnostics() {
 	PulseDiag diag;
-	TaskHandle_t handle = nullptr;
-	{
-		PulseLock lock(_impl->mutex);
-		if (!lock) {
-			return diag;
-		}
-		handle = _impl->taskHandle;
-		diag.commandQueueSize = _impl->config.commandQueueSize;
-		diag.commandQueueUsed =
-		    _impl->commandQueue != nullptr ?
-		        static_cast<uint32_t>(uxQueueMessagesWaiting(_impl->commandQueue)) :
-		        0;
-		diag.executedCallbackCount = _impl->executedCallbackCount;
-		diag.droppedCommandCount = _impl->droppedCommandCount;
-		diag.lateCallbackCount = _impl->lateCallbackCount;
-		diag.stackHighWaterMarkBytes = _impl->stackHighWaterMarkBytes;
-		diag.requestedStackType = _impl->config.stackType;
-		diag.actualStackType = _impl->actualStackType;
-
-		for (uint32_t index = 0; index < _impl->timerCount; index++) {
-			const auto &timer = _impl->timers[index];
-			if (!timer) {
-				continue;
-			}
-			if (timer->type == PulseTimerType::Timeout) {
-				diag.timeoutCount++;
-			} else if (timer->type == PulseTimerType::Interval) {
-				diag.intervalCount++;
-			} else {
-				diag.countdownCount++;
-			}
-			if (timer->state == PulseTimerState::Running) {
-				diag.runningCount++;
-			} else if (timer->state == PulseTimerState::Paused) {
-				diag.pausedCount++;
-			}
-		}
+	PulseImpl *impl = _impl.load(std::memory_order_acquire);
+	if (impl == nullptr) {
+		return diag;
 	}
-	if (handle != nullptr) {
-		diag.stackHighWaterMarkBytes = pulse_task_support::stackHighWaterMarkBytes(handle);
+	PulseLock lock(impl->mutex);
+	if (!lock) {
+		return diag;
+	}
+
+	diag.commandQueueSize = impl->config.commandQueueSize;
+	diag.commandQueueUsed = impl->queueUsageLocked();
+	diag.executedCallbackCount = impl->executedCallbackCount;
+	diag.droppedCommandCount = impl->droppedCommandCount;
+	diag.lateCallbackCount = impl->lateCallbackCount;
+	diag.stackHighWaterMarkBytes = impl->finalStackHighWaterMarkBytes;
+	diag.requestedStackType = impl->config.stackType;
+	diag.actualStackType = impl->actualStackType;
+
+	if (impl->taskHandle != nullptr) {
+		diag.stackHighWaterMarkBytes =
+		    pulse_task_support::stackHighWaterMarkBytes(impl->taskHandle);
+	}
+	for (uint32_t index = 0; index < impl->timerCount; index++) {
+		const auto &timer = impl->timers[index];
+		if (!timer) {
+			continue;
+		}
+		if (timer->type == PulseTimerType::Timeout) {
+			diag.timeoutCount++;
+		} else if (timer->type == PulseTimerType::Interval) {
+			diag.intervalCount++;
+		} else {
+			diag.countdownCount++;
+		}
+		if (timer->state == PulseTimerState::Running) {
+			diag.runningCount++;
+		} else if (timer->state == PulseTimerState::Paused) {
+			diag.pausedCount++;
+		}
 	}
 	return diag;
 }
