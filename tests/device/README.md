@@ -1,5 +1,7 @@
 # Device smoke tests
 
+The Arduino smoke sketch lives in `extras/PulseSmoke` so the library remains compliant with the Arduino library specification.
+
 Compile and run `PulseSmoke` on:
 
 - classic ESP32 with `PulseStackType::Internal`;
