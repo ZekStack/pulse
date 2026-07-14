@@ -214,7 +214,7 @@ jobs:
 
       - name: Compile on-device smoke suite
         run: |
-          pio ci tests/device/PulseSmoke \
+          pio ci extras/PulseSmoke \
             --board ${{ matrix.board }} \
             --lib="." \
             --project-option "platform=${PIOARDUINO_PLATFORM_URL}" \
@@ -289,7 +289,7 @@ jobs:
           arduino-cli compile \
             --fqbn "$FQBN" \
             --build-property "compiler.cpp.extra_flags=-std=gnu++20 -DPULSE_SMOKE_USE_PSRAM=0" \
-            tests/device/PulseSmoke
+            extras/PulseSmoke
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
