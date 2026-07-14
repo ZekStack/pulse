@@ -359,13 +359,14 @@ extern "C" EventBits_t xEventGroupWaitBits(
 			eventGroup->condition.wait_for(lock, std::chrono::milliseconds(ticksToWait), ready);
 		}
 	}
+	const bool completed = ready();
 	const EventBits_t result = eventGroup->bits;
-	if (clearOnExit == pdTRUE && ready()) {
+	if (clearOnExit == pdTRUE && completed) {
 		eventGroup->bits &= ~bitsToWaitFor;
 	}
 	lock.unlock();
 
-	if (holdCurrentEventWaiter) {
+	if (holdCurrentEventWaiter && completed) {
 		std::unique_lock<std::mutex> heldLock(heldEventMutex);
 		heldEventWaiterCount++;
 		heldEventCondition.notify_all();
