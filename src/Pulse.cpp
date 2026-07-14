@@ -632,7 +632,6 @@ struct PulseImpl {
 		std::unique_ptr<std::shared_ptr<PulseTimerRecord>[]> detachedActiveTimers;
 		QueueHandle_t detachedQueue = nullptr;
 		bool withCaps = false;
-		EventGroupHandle_t completion = nullptr;
 
 		{
 			PulseLock lock(mutex);
@@ -646,7 +645,6 @@ struct PulseImpl {
 				activeTimerCount = 0;
 				nextTimerId = 1;
 				withCaps = createdWithCaps;
-				completion = completionEvent;
 			}
 		}
 
@@ -663,10 +661,10 @@ struct PulseImpl {
 				finalStackHighWaterMarkBytes = finalStack;
 				taskHandle = nullptr;
 				lifecycle = PulseLifecycleState::Stopped;
+				if (completionEvent != nullptr) {
+					xEventGroupSetBits(completionEvent, kCompletionBit);
+				}
 			}
-		}
-		if (completion != nullptr) {
-			xEventGroupSetBits(completion, kCompletionBit);
 		}
 
 		release();
@@ -682,6 +680,7 @@ struct PulseImpl {
 			vTaskDelete(nullptr);
 			return;
 		}
+		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 		impl->taskLoop();
 		impl->quiesceAndDeleteSelf();
 	}
@@ -1004,6 +1003,7 @@ PulseResult Pulse::init(const PulseConfig &config) {
 	impl->taskHandle = handle;
 	impl->createdWithCaps = createdWithCaps;
 	impl->lifecycle = PulseLifecycleState::Running;
+	xTaskNotifyGive(handle);
 	return PulseResult::success("pulse initialized");
 }
 
