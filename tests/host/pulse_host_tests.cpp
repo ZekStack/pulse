@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <functional>
 #include <iostream>
 #include <mutex>
@@ -185,27 +186,38 @@ bool testRepeatedLifecycleCycles() {
 	}
 	return true;
 }
+
+struct TestCase {
+	const char *name;
+	bool (*run)();
+};
+
+constexpr TestCase tests[] = {
+    {"stack-high-water-bytes", &testStackHighWaterUsesBytes},
+    {"clear-already-due-timer", &testDueTimerCanBeClearedFromCallback},
+    {"callback-end-busy", &testEndFromCallbackReturnsBusy},
+    {"self-pause-interval", &testSelfPausePreservesFullInterval},
+    {"long-callback-shutdown", &testLongCallbackEndTimeoutAndRetry},
+    {"repeated-lifecycle", &testRepeatedLifecycleCycles},
+};
 } // namespace
 
-int main() {
-	const struct {
-		const char *name;
-		bool (*run)();
-	} tests[] = {
-	    {"stack high-water bytes", &testStackHighWaterUsesBytes},
-	    {"clear already-due timer", &testDueTimerCanBeClearedFromCallback},
-	    {"callback end busy", &testEndFromCallbackReturnsBusy},
-	    {"self-pause interval", &testSelfPausePreservesFullInterval},
-	    {"long callback shutdown", &testLongCallbackEndTimeoutAndRetry},
-	    {"repeated lifecycle", &testRepeatedLifecycleCycles},
-	};
-
+int main(int argc, char **argv) {
+	bool matched = argc == 1;
 	for (const auto &test : tests) {
+		if (argc > 1 && std::strcmp(argv[1], test.name) != 0) {
+			continue;
+		}
+		matched = true;
 		std::cout << "RUN: " << test.name << std::endl;
 		if (!test.run()) {
 			return 1;
 		}
 	}
-	std::cout << "All Pulse host tests passed" << std::endl;
+	if (!matched) {
+		std::cerr << "Unknown test: " << argv[1] << std::endl;
+		return 2;
+	}
+	std::cout << "Selected Pulse host tests passed" << std::endl;
 	return 0;
 }
