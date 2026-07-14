@@ -407,6 +407,11 @@ void fakeSetStackHighWaterMark(size_t bytes) {
 	stackHighWaterMark.store(bytes);
 }
 
+size_t fakeActiveTaskCount() {
+	std::lock_guard<std::mutex> lock(tasksMutex);
+	return tasks.size();
+}
+
 void fakeSuspendTaskNotifications() {
 	notificationsSuspended.store(true);
 }
