@@ -1,8 +1,10 @@
 #pragma once
 
 #include <Arduino.h>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
-#include <memory>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -115,7 +117,7 @@ struct PulseDiag {
 
 class Pulse {
   public:
-	Pulse();
+	Pulse() noexcept = default;
 	~Pulse();
 
 	Pulse(const Pulse &) = delete;
@@ -148,5 +150,5 @@ class Pulse {
 	const char *timerTypeToString(PulseTimerType type) const;
 
   private:
-	std::unique_ptr<PulseImpl> _impl;
+	std::atomic<PulseImpl *> _impl{nullptr};
 };

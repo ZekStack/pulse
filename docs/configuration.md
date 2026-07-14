@@ -1,7 +1,5 @@
 # Configuration
 
-`PulseConfig` controls the internal task, command queue, and timer limits.
-
 ```cpp
 PulseConfig config;
 config.stackSizeBytes = 4096;
@@ -13,37 +11,35 @@ config.maxIntervals = 16;
 config.maxCountdowns = 8;
 config.commandQueueSize = 20;
 config.taskName = "pulse-task";
-
-PulseResult result = pulse.init(config);
 ```
 
 ## Task settings
 
-Stack sizes are ESP32 FreeRTOS byte sizes. Pulse rejects stack sizes below 1024 bytes or values that are not aligned to `sizeof(StackType_t)`.
+ESP32 FreeRTOS task stack sizes are byte values. Pulse requires at least 1024 bytes and alignment to `sizeof(StackType_t)`.
 
-`PulseStackType::Auto` uses PSRAM task stacks when the ESP-IDF support is available and PSRAM is present. It falls back to internal RAM otherwise.
+`PulseStackType::Internal` uses internal memory. `Psram` requires ESP-IDF external-stack support and available PSRAM. `Auto` prefers PSRAM and falls back to internal memory.
+
+The command queue stores commands by value. Queue sends are nonblocking; a full queue returns `QueueFull`.
+
+The task is awakened through direct task notifications. Shutdown therefore does not need command-queue space and cannot be ordered behind ordinary controls.
 
 ## Limits
 
-The timer limits are per type:
-
 | Field | Meaning |
 | --- | --- |
-| `maxTimeouts` | Maximum active or paused timeouts. |
-| `maxIntervals` | Maximum active or paused intervals. |
-| `maxCountdowns` | Maximum active or paused countdowns. |
-| `commandQueueSize` | Number of pending control commands. |
+| `maxTimeouts` | Active or paused timeouts. |
+| `maxIntervals` | Active or paused intervals. |
+| `maxCountdowns` | Active or paused countdowns. |
+| `commandQueueSize` | Pending timer-control commands. |
 
-If a limit is reached, creation returns a failed `PulseTimerResult`.
+The total timer capacity must be non-zero and must not overflow `uint32_t`.
 
-During `init()`, Pulse validates that the configured timer limits have a non-zero total and do not overflow. It then allocates pre-sized internal pointer arrays for `maxTimeouts + maxIntervals + maxCountdowns` timer slots. Timer records, `shared_ptr` control blocks, user callbacks, and `std::function` captures may still allocate.
+Pulse preallocates bounded pointer registries. Timer records are allocated individually with checked non-throwing allocation and use intrusive reference counting so task callbacks can safely outlive registry removal.
 
-Fully fixed-capacity timer record storage is planned for a later hardening pass.
+User-provided `std::function` callbacks and their captures retain standard-library allocation behavior.
 
-The command queue stores control commands by value. If the queue is full, queued operations return `PulseStatus::QueueFull`.
+## Timing
 
-## Timing rules
+All deadlines use ESP-IDF's 64-bit monotonic runtime timer. Zero delay, interval, duration, and tick values are rejected.
 
-All timing uses ESP-IDF's 64-bit monotonic runtime timer. Pulse is not affected by NTP sync, timezone changes, DST, or system date corrections.
-
-Zero-millisecond delay, interval, duration, and tick values are rejected.
+Intervals and countdowns use delay-after-callback scheduling. They do not catch up elapsed ticks after a long callback.

@@ -1,20 +1,22 @@
 # Pulse
 
-Pulse is a millisecond timer library for ESP32.
+Pulse is a millisecond timer library for Arduino ESP32 projects.
 
-Pulse helps you schedule short runtime timeouts, intervals, and countdowns in Arduino ESP32 projects. It is designed for uptime-based timing that should not be affected by NTP sync, timezone changes, DST changes, or system date corrections.
+It schedules uptime-based timeouts, intervals, and countdowns without being affected by NTP synchronization, timezone changes, daylight-saving changes, or wall-clock corrections.
 
 [![CI](https://github.com/ZekStack/pulse/actions/workflows/ci.yml/badge.svg)](https://github.com/ZekStack/pulse/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/ZekStack/pulse?sort=semver)](https://github.com/ZekStack/pulse/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE.md)
 
-## Why use Pulse?
+## Highlights
 
-* **Uptime timers** - all timing is based on ESP-IDF's monotonic runtime timer.
-* **One task** - timeouts, intervals, and countdowns are coordinated by one internal Pulse task.
-* **Bounded counts** - configured limits cap each timer type and the command queue.
-* **Task-side callbacks** - callbacks run from the internal Pulse task.
-* **Production-minded** - result-based errors, diagnostics, thread-safe internals, and no exceptions.
+- **Monotonic timing** using ESP-IDF's 64-bit runtime timer.
+- **One internal task** for all timers and callbacks.
+- **Bounded counts** for timeouts, intervals, countdowns, and queued controls.
+- **Lifecycle-safe shutdown** with timeout/retry behavior and safe destruction.
+- **Callback-safe controls** with deterministic ordering between already-due timers.
+- **Diagnostics** for timer counts, queue use, callback execution, lateness, and task stack.
+- **No explicit exceptions** in Pulse production sources.
 
 ## Install
 
@@ -37,13 +39,13 @@ build_unflags =
 
 ### Arduino IDE
 
-Pulse is not published to Arduino Library Manager yet.
+Pulse is not published to Arduino Library Manager yet. Download the repository ZIP or clone it into:
 
-Install it by downloading the repository ZIP or cloning it into your Arduino libraries folder.
-
-```txt
+```text
 Arduino/libraries/Pulse
 ```
+
+Compile the sketch with C++20 support.
 
 ## Quick start
 
@@ -57,9 +59,9 @@ PulseTimerId intervalId = 0;
 void setup() {
 	Serial.begin(115200);
 
-	PulseResult initResult = pulse.init();
-	if (!initResult) {
-		Serial.println(initResult.message);
+	PulseResult initialized = pulse.init();
+	if (!initialized) {
+		Serial.println(initialized.message);
 		return;
 	}
 
@@ -81,96 +83,54 @@ void loop() {
 }
 ```
 
-## Important notes
-
-> [!IMPORTANT]
-> Pulse callbacks run from the internal Pulse task. Keep callbacks short and offload long-running work to Worker.
-
-* `setInterval()` uses delay-after-callback timing and does not catch up missed ticks.
-* Countdown callbacks first run after `tickMs`; the final callback is guaranteed with `isFinished=true`.
-* `clear()`, `pause()`, `resume()`, and `restart()` are queued control commands.
-* Zero-millisecond timer values are rejected.
-* Stack sizes are FreeRTOS byte sizes on ESP32 and must be at least 1024 bytes.
-* `PulseStackType::Auto` prefers PSRAM task stacks when supported and falls back to internal RAM.
-
-## Timing guarantees
-
-Pulse uses ESP-IDF's 64-bit monotonic runtime timer internally. It is intended for short runtime timers, not wall-clock scheduling.
-
-## Threading model
-
-All callbacks run from the internal Pulse task. Control methods are thread-safe and queued, so a successful `clear()`, `pause()`, `resume()`, or `restart()` means the command was accepted, not necessarily already applied. Pulse callbacks may call these control methods; the queued operation takes effect after the current callback returns.
-
-## Memory model
-
-Pulse has bounded timer counts and preallocated internal timer pointer storage, but timer records, user callbacks, and `std::function` captures may allocate.
-
-Timer records and `shared_ptr` control blocks still allocate dynamically. Fully fixed-capacity timer record storage is planned for a later hardening pass.
-
-## Examples
-
-| Example | Description |
-| --- | --- |
-| `Basic` | Minimal init, timeout, interval, and clear. |
-| `Countdown` | Countdown ticks and final completion callback. |
-| `PauseResumeRestart` | Timer pause, resume, restart, and state checks. |
-| `ConfigAndLimits` | Stack, queue, and timer limit configuration. |
-| `Diagnostics` | Runtime counters and queue diagnostics. |
-| `BindableCallbacks` | `std::bind` with private class methods. |
-
-Start with:
-
-```txt
-examples/Basic
-```
-
-## Documentation
-
-Detailed documentation is available in the `docs/` folder.
-
-| Document | Description |
-| --- | --- |
-| [`docs/getting-started.md`](docs/getting-started.md) | Step-by-step setup and first timer flow. |
-| [`docs/configuration.md`](docs/configuration.md) | Config options, limits, stack behavior, and queue sizing. |
-| [`docs/api.md`](docs/api.md) | Public classes, result types, timer controls, and diagnostics. |
-| [`docs/examples.md`](docs/examples.md) | Explanation of all included examples. |
-| [`docs/troubleshooting.md`](docs/troubleshooting.md) | Common issues and solutions. |
-
-## API overview
+## Countdown
 
 ```cpp
-Pulse pulse;
-pulse.init();
-
-PulseTimerResult timeout = pulse.setTimeout([]() {}, 1000);
-PulseTimerResult interval = pulse.setInterval([]() {}, 1000);
-
 PulseCountdownConfig countdown;
 countdown.durationMs = 10000;
 countdown.tickMs = 1000;
-pulse.setCountdown(countdown, [](const PulseCountdownTick &tick) {});
 
-pulse.pause(interval.id);
-pulse.resume(interval.id);
-pulse.clear(interval.id);
-
-PulseDiag diag = pulse.getDiagnostics();
+pulse.setCountdown(countdown, [](const PulseCountdownTick &tick) {
+	Serial.printf(
+	    "remaining=%u finished=%s\n",
+	    static_cast<unsigned>(tick.remainingMs),
+	    tick.isFinished ? "true" : "false"
+	);
+});
 ```
 
-For the full API, see [`docs/api.md`](docs/api.md).
+The first callback runs after `tickMs`. The final callback has `remainingMs == 0` and `isFinished == true`, including when `durationMs` is not divisible by `tickMs`.
 
-## Compatibility
+## Callback context and ordering
 
-| Item | Support |
-| --- | --- |
-| Framework | Arduino ESP32 |
-| Platform | `espressif32` |
-| Language | C++20 |
-| Filesystem | none |
-| PSRAM | Optional for task stacks when ESP-IDF support is available |
-| Dependencies | none |
-| Exceptions | Not used |
-| Status | Early-stage `0.0.1` |
+All callbacks run serially from the internal Pulse task. Keep them short and offload blocking work.
+
+`clear()`, `pause()`, `resume()`, and `restart()` are queued controls. While Pulse remains in the same running lifecycle generation, controls accepted during a callback are processed before another already-due timer is dispatched.
+
+Timeouts and final countdown ticks are terminal before their callback begins. Controls targeting that same terminal timer return `PulseStatus::TimerNotFound`.
+
+Intervals and non-final countdowns remain controllable during callbacks. A callback-side pause preserves the next full interval or countdown delay. A callback-side restart is not overwritten by normal rescheduling.
+
+## Shutdown behavior
+
+```cpp
+PulseResult result = pulse.end(5000);
+```
+
+- `end()` requests shutdown through a dedicated task wake path, independent of command-queue capacity.
+- Calling `end()` from a Pulse callback returns `PulseStatus::Busy` because the task cannot wait for itself.
+- If `end(timeoutMs)` times out, Pulse remains safely in the stopping state. Call `end()` again to continue waiting.
+- Timer creation and controls return `PulseStatus::Busy` while stopping.
+- External destruction waits until the Pulse task is quiescent and no longer accesses the implementation.
+- Callbacks must eventually return; otherwise external destruction can wait indefinitely.
+
+A successfully queued timer control may be superseded by shutdown because all timers are being destroyed.
+
+## Memory and allocation model
+
+Timer counts and pointer registries are bounded by `PulseConfig`. Timer records use checked non-throwing allocation and intrusive lifetime ownership.
+
+Pulse does not explicitly throw exceptions. Construction and storage of user-provided `std::function` callbacks and their captures follow standard-library and toolchain allocation behavior. A no-exceptions build proves compile compatibility, not graceful handling of every standard-library allocation failure.
 
 ## Configuration
 
@@ -184,31 +144,47 @@ config.maxTimeouts = 16;
 config.maxIntervals = 16;
 config.maxCountdowns = 8;
 config.commandQueueSize = 20;
+config.taskName = "pulse-task";
 
 PulseResult result = pulse.init(config);
 ```
 
-For all options, see [`docs/configuration.md`](docs/configuration.md).
+`PulseStackType::Auto` prefers a PSRAM task stack when supported and otherwise uses internal RAM.
 
-## Error handling
-
-Pulse reports operation status through `PulseResult` and `PulseTimerResult`.
+## Diagnostics
 
 ```cpp
-PulseTimerResult result = pulse.setTimeout([]() {}, 1000);
-
-if (!result) {
-	Serial.println(result.message);
-	return;
-}
+PulseDiag diag = pulse.getDiagnostics();
 ```
 
-For result fields and status codes, see [`docs/api.md`](docs/api.md).
+Diagnostics include timer counts, running and paused counts, command queue capacity and use, callback counters, late callbacks, requested and actual stack type, and stack high-water bytes.
+
+ESP-IDF reports stack high-water values in bytes; Pulse returns those values directly. During shutdown, diagnostics remain available. After the task becomes quiescent, the last stored high-water value is returned.
+
+## Compatibility
+
+| Item | Support |
+| --- | --- |
+| Version | `0.1.0` |
+| Framework | Arduino ESP32 |
+| Language | C++20 |
+| Targets compiled in CI | ESP32, S3, C3, P4 |
+| PSRAM | Optional task stack |
+| Filesystem | None |
+| External dependencies | None |
+| Wall-clock scheduling | Not supported |
+
+## Documentation
+
+- [`docs/getting-started.md`](docs/getting-started.md)
+- [`docs/configuration.md`](docs/configuration.md)
+- [`docs/api.md`](docs/api.md)
+- [`docs/examples.md`](docs/examples.md)
+- [`docs/troubleshooting.md`](docs/troubleshooting.md)
+- [`CHANGELOG.md`](CHANGELOG.md)
 
 ## License
 
-MIT - see [`LICENSE.md`](LICENSE.md).
-
-## ZekStack
+MIT — see [`LICENSE.md`](LICENSE.md).
 
 Part of the ZekStack ESP32 library stack.

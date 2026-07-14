@@ -48,7 +48,8 @@ inline bool isValidStackSize(size_t stackBytes) {
 
 inline size_t currentStackHighWaterMarkBytes() {
 #if defined(INCLUDE_uxTaskGetStackHighWaterMark) && (INCLUDE_uxTaskGetStackHighWaterMark == 1)
-	return static_cast<size_t>(uxTaskGetStackHighWaterMark(nullptr)) * sizeof(StackType_t);
+	// ESP-IDF reports the stack high-water mark in bytes.
+	return static_cast<size_t>(uxTaskGetStackHighWaterMark(nullptr));
 #else
 	return 0;
 #endif
@@ -59,11 +60,22 @@ inline size_t stackHighWaterMarkBytes(TaskHandle_t handle) {
 	if (handle == nullptr) {
 		return 0;
 	}
-	return static_cast<size_t>(uxTaskGetStackHighWaterMark(handle)) * sizeof(StackType_t);
+	// ESP-IDF reports the stack high-water mark in bytes.
+	return static_cast<size_t>(uxTaskGetStackHighWaterMark(handle));
 #else
 	(void)handle;
 	return 0;
 #endif
+}
+
+inline bool isCurrentTask(TaskHandle_t handle) {
+	return handle != nullptr && xTaskGetCurrentTaskHandle() == handle;
+}
+
+inline void wakeTask(TaskHandle_t handle) {
+	if (handle != nullptr) {
+		xTaskNotifyGive(handle);
+	}
 }
 
 inline BaseType_t createTask(
@@ -129,6 +141,8 @@ inline void deleteCurrentTask(bool withCaps) {
 		vTaskDeleteWithCaps(xTaskGetCurrentTaskHandle());
 		return;
 	}
+#else
+	(void)withCaps;
 #endif
 	vTaskDelete(nullptr);
 }
