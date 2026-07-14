@@ -1,6 +1,10 @@
 #include <Arduino.h>
 #include <Pulse.h>
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
+
 #ifndef PULSE_SMOKE_USE_PSRAM
 #define PULSE_SMOKE_USE_PSRAM 0
 #endif
