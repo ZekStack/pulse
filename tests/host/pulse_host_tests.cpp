@@ -188,7 +188,7 @@ bool testRepeatedLifecycleCycles() {
 	auto *selfOwned = new Pulse();
 	REQUIRE(selfOwned->init());
 	REQUIRE(waitForQueueEmpty(*selfOwned));
-	REQUIRE(fakeActiveTaskCount() == 1);
+	REQUIRE(waitUntil([]() { return fakeActiveTaskCount() == 1; }));
 	std::atomic<bool> destructorReturned{false};
 	Pulse *callbackOwned = selfOwned;
 	REQUIRE(selfOwned->setTimeout(
