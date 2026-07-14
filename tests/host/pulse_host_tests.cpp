@@ -50,12 +50,13 @@ bool testDueTimerCanBeClearedFromCallback() {
 	REQUIRE(pulse.init());
 	std::atomic<uint32_t> firstCount{0};
 	std::atomic<uint32_t> secondCount{0};
+	std::atomic<bool> clearAccepted{false};
 	PulseTimerId secondId = 0;
 
 	REQUIRE(pulse.setTimeout(
 	    [&]() {
 		    firstCount++;
-		    REQUIRE(pulse.clear(secondId));
+		    clearAccepted.store(static_cast<bool>(pulse.clear(secondId)));
 	    },
 	    100
 	));
@@ -67,6 +68,7 @@ bool testDueTimerCanBeClearedFromCallback() {
 	fakeAdvanceTimeMs(100);
 	fakeWakeAllTasks();
 	REQUIRE(waitUntil([&]() { return firstCount.load() == 1; }));
+	REQUIRE(clearAccepted.load());
 	std::this_thread::sleep_for(20ms);
 	REQUIRE(secondCount.load() == 0);
 	REQUIRE(pulse.end());
@@ -94,12 +96,13 @@ bool testSelfPausePreservesFullInterval() {
 	Pulse pulse;
 	REQUIRE(pulse.init());
 	std::atomic<uint32_t> callbackCount{0};
+	std::atomic<bool> pauseAccepted{false};
 	PulseTimerId intervalId = 0;
 	PulseTimerResult interval = pulse.setInterval(
 	    [&]() {
 		    const uint32_t count = ++callbackCount;
 		    if (count == 1) {
-			    REQUIRE(pulse.pause(intervalId));
+			    pauseAccepted.store(static_cast<bool>(pulse.pause(intervalId)));
 		    }
 	    },
 	    100
@@ -111,6 +114,7 @@ bool testSelfPausePreservesFullInterval() {
 	fakeAdvanceTimeMs(100);
 	fakeWakeAllTasks();
 	REQUIRE(waitUntil([&]() { return callbackCount.load() == 1; }));
+	REQUIRE(pauseAccepted.load());
 	REQUIRE(waitUntil([&]() { return pulse.getState(intervalId) == PulseTimerState::Paused; }));
 
 	REQUIRE(pulse.resume(intervalId));
