@@ -84,18 +84,24 @@ jobs:
       - name: Build host runtime tests
         run: |
           mkdir -p build/host-tests
-          g++ \
-            -std=c++20 \
-            -pthread \
-            -Wall \
-            -Wextra \
-            -Wpedantic \
-            -Itests/host/include \
-            -Isrc \
-            src/Pulse.cpp \
-            tests/host/freertos_fake.cpp \
+          common_sources=(src/Pulse.cpp tests/host/freertos_fake.cpp)
+          common_flags=(
+            -std=c++20
+            -pthread
+            -Wall
+            -Wextra
+            -Wpedantic
+            -Itests/host/include
+            -Isrc
+          )
+          g++ "${common_flags[@]}" \
+            "${common_sources[@]}" \
             tests/host/pulse_host_tests.cpp \
             -o build/host-tests/pulse-host-tests
+          g++ "${common_flags[@]}" \
+            "${common_sources[@]}" \
+            tests/host/pulse_extended_tests.cpp \
+            -o build/host-tests/pulse-extended-tests
 
       - name: Stack high-water bytes
         run: ./build/host-tests/pulse-host-tests stack-high-water-bytes
@@ -114,6 +120,24 @@ jobs:
 
       - name: Repeated lifecycle cycles
         run: ./build/host-tests/pulse-host-tests repeated-lifecycle
+
+      - name: Scheduler ordering and countdown semantics
+        run: ./build/host-tests/pulse-extended-tests scheduler-semantics
+
+      - name: Restart and pause semantics
+        run: ./build/host-tests/pulse-extended-tests restart-and-pause
+
+      - name: Queue-full rollback and shutdown priority
+        run: ./build/host-tests/pulse-extended-tests queue-and-shutdown
+
+      - name: Concurrent initialization, stale waiters, and destruction
+        run: ./build/host-tests/pulse-extended-tests lifecycle-concurrency
+
+      - name: Callback destruction and diagnostics
+        run: ./build/host-tests/pulse-extended-tests cleanup-and-diagnostics
+
+      - name: Callback command batch ordering
+        run: ./build/host-tests/pulse-extended-tests callback-command-batch
 
   no-exceptions-build:
     runs-on: ubuntu-latest
