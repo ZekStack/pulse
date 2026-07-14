@@ -228,7 +228,7 @@ jobs:
           arduino-cli compile \
             --fqbn "$FQBN" \
             --build-property "compiler.cpp.extra_flags=-std=gnu++20" \
-            tests/device/PulseSmoke
+            extras/PulseSmoke
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
