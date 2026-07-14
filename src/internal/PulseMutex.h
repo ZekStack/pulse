@@ -19,6 +19,10 @@ class PulseMutex {
 	PulseMutex(const PulseMutex &) = delete;
 	PulseMutex &operator=(const PulseMutex &) = delete;
 
+	bool valid() const {
+		return _handle != nullptr;
+	}
+
 	bool lock(TickType_t timeout = portMAX_DELAY) {
 		return _handle != nullptr && xSemaphoreTakeRecursive(_handle, timeout) == pdTRUE;
 	}

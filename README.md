@@ -14,7 +14,8 @@ Pulse helps you schedule short runtime timeouts, intervals, and countdowns in Ar
 * **One task** - timeouts, intervals, and countdowns are coordinated by one internal Pulse task.
 * **Bounded counts** - configured limits cap each timer type and the command queue.
 * **Task-side callbacks** - callbacks run from the internal Pulse task.
-* **Production-minded** - result-based errors, diagnostics, thread-safe internals, and no exceptions.
+* **Lifecycle-safe shutdown** - shutdown is independent of command-queue capacity and may be retried after a timeout.
+* **Production-minded** - result-based errors, synchronized lifecycle operations, diagnostics, and no explicit exceptions.
 
 ## Install
 
@@ -88,24 +89,55 @@ void loop() {
 
 * `setInterval()` uses delay-after-callback timing and does not catch up missed ticks.
 * Countdown callbacks first run after `tickMs`; the final callback is guaranteed with `isFinished=true`.
-* `clear()`, `pause()`, `resume()`, and `restart()` are queued control commands.
+* `clear()`, `pause()`, `resume()`, and `restart()` enqueue nonblocking control commands.
+* A control that returns success is accepted for the current running lifecycle generation. Shutdown supersedes pending timer controls.
+* Controls queued by a callback are processed before another already-due timer is selected.
+* A timeout and a final countdown are terminal before their callback runs. Controls for that timer return `TimerNotFound` from the terminal callback.
+* Calling `end()` from a Pulse callback returns `PulseStatus::Busy` because the task cannot wait for itself.
+* If `end(timeoutMs)` returns `Timeout`, shutdown remains requested. Call `end()` again to continue waiting.
+* Destroying Pulse from another task waits until the scheduler is quiesced. Callbacks must eventually return.
 * Zero-millisecond timer values are rejected.
 * Stack sizes are FreeRTOS byte sizes on ESP32 and must be at least 1024 bytes.
+* Stack high-water diagnostics use the ESP-IDF byte value directly.
 * `PulseStackType::Auto` prefers PSRAM task stacks when supported and falls back to internal RAM.
 
 ## Timing guarantees
 
 Pulse uses ESP-IDF's 64-bit monotonic runtime timer internally. It is intended for short runtime timers, not wall-clock scheduling.
 
-## Threading model
+## Threading and lifecycle model
 
-All callbacks run from the internal Pulse task. Control methods are thread-safe and queued, so a successful `clear()`, `pause()`, `resume()`, or `restart()` means the command was accepted, not necessarily already applied. Pulse callbacks may call these control methods; the queued operation takes effect after the current callback returns.
+All callbacks run from the internal Pulse task. Timer creation and control methods synchronize against initialization and shutdown.
 
-## Memory model
+Each successful `init()` begins a new internal lifecycle generation. `end()` targets the generation that was running when the call began. A delayed waiter from an older generation cannot stop a newer run.
 
-Pulse has bounded timer counts and preallocated internal timer pointer storage, but timer records, user callbacks, and `std::function` captures may allocate.
+The internal lifecycle is:
 
-Timer records and `shared_ptr` control blocks still allocate dynamically. Fully fixed-capacity timer record storage is planned for a later hardening pass.
+```txt
+Uninitialized -> Running -> Stopping -> Stopped -> Uninitialized
+```
+
+`Stopping` means shutdown was requested but an active callback or scheduler cleanup may still be in progress. Timer creation and controls return `Busy` in this state. Diagnostics remain available.
+
+`Stopped` means scheduler resources are quiesced and the scheduler task will no longer access them. Physical FreeRTOS task deletion follows using task-local values. A waiting `end()` then completes public lifecycle finalization.
+
+Shutdown has a dedicated task wakeup and does not use the bounded command queue.
+
+## Callback control semantics
+
+Controls from interval and non-final countdown callbacks are applied after the callback returns and before another due timer is dispatched.
+
+An interval that pauses itself resumes after a complete interval. A non-final countdown that pauses itself preserves the delay until its next countdown tick.
+
+Timeouts and final countdowns are removed from the registry before their terminal callback. Their own `clear()`, `pause()`, `resume()`, and `restart()` calls therefore return `TimerNotFound`.
+
+## Memory and exception model
+
+Pulse does not explicitly throw exceptions. Internal Pulse allocations use checked non-throwing allocation where practical.
+
+Timer records, `shared_ptr` control blocks, user callbacks, and `std::function` captures may allocate. Construction and storage of user-provided callbacks follow the standard-library and toolchain allocation behavior. A build with exceptions disabled proves compilation compatibility; it does not guarantee graceful failure for every standard-library allocation.
+
+Fully fixed-capacity callback and timer-record storage may be introduced in a later release.
 
 ## Examples
 
@@ -132,7 +164,7 @@ Detailed documentation is available in the `docs/` folder.
 | --- | --- |
 | [`docs/getting-started.md`](docs/getting-started.md) | Step-by-step setup and first timer flow. |
 | [`docs/configuration.md`](docs/configuration.md) | Config options, limits, stack behavior, and queue sizing. |
-| [`docs/api.md`](docs/api.md) | Public classes, result types, timer controls, and diagnostics. |
+| [`docs/api.md`](docs/api.md) | Public classes, lifecycle, timer controls, and diagnostics. |
 | [`docs/examples.md`](docs/examples.md) | Explanation of all included examples. |
 | [`docs/troubleshooting.md`](docs/troubleshooting.md) | Common issues and solutions. |
 
@@ -169,8 +201,8 @@ For the full API, see [`docs/api.md`](docs/api.md).
 | Filesystem | none |
 | PSRAM | Optional for task stacks when ESP-IDF support is available |
 | Dependencies | none |
-| Exceptions | Not used |
-| Status | Early-stage `0.0.1` |
+| Exceptions | No explicit throws; `std::function` follows toolchain behavior |
+| Status | `0.1.0` release candidate |
 
 ## Configuration
 
