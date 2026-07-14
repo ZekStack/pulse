@@ -184,6 +184,25 @@ bool testRepeatedLifecycleCycles() {
 		REQUIRE(pulse.init());
 		REQUIRE(pulse.end());
 	}
+
+	auto *selfOwned = new Pulse();
+	REQUIRE(selfOwned->init());
+	REQUIRE(waitForQueueEmpty(*selfOwned));
+	REQUIRE(fakeActiveTaskCount() == 1);
+	std::atomic<bool> destructorReturned{false};
+	Pulse *callbackOwned = selfOwned;
+	REQUIRE(selfOwned->setTimeout(
+	    [callbackOwned, &destructorReturned]() {
+		    delete callbackOwned;
+		    destructorReturned = true;
+	    },
+	    1000
+	));
+	REQUIRE(waitForQueueEmpty(*selfOwned));
+	fakeAdvanceTimeMs(1000);
+	fakeWakeAllTasks();
+	REQUIRE(waitUntil([&]() { return destructorReturned.load(); }));
+	REQUIRE(waitUntil([]() { return fakeActiveTaskCount() == 0; }));
 	return true;
 }
 
