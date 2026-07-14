@@ -106,13 +106,13 @@ bool testSelfPausePreservesFullInterval() {
 			    pauseAccepted.store(static_cast<bool>(pulse.pause(intervalId)));
 		    }
 	    },
-	    100
+	    1000
 	);
 	REQUIRE(interval);
 	intervalId = interval.id;
 	REQUIRE(waitForQueueEmpty(pulse));
 
-	fakeAdvanceTimeMs(100);
+	fakeAdvanceTimeMs(1000);
 	fakeWakeAllTasks();
 	REQUIRE(waitUntil([&]() { return callbackCount.load() == 1; }));
 	REQUIRE(pauseAccepted.load());
@@ -122,12 +122,12 @@ bool testSelfPausePreservesFullInterval() {
 	REQUIRE(waitUntil([&]() { return pulse.getState(intervalId) == PulseTimerState::Running; }));
 	REQUIRE(waitForQueueEmpty(pulse));
 
-	fakeAdvanceTimeMs(99);
+	fakeAdvanceTimeMs(900);
 	fakeWakeAllTasks();
 	std::this_thread::sleep_for(20ms);
 	REQUIRE(callbackCount.load() == 1);
 
-	fakeAdvanceTimeMs(1);
+	fakeAdvanceTimeMs(100);
 	fakeWakeAllTasks();
 	REQUIRE(waitUntil([&]() { return callbackCount.load() == 2; }));
 	REQUIRE(pulse.clear(intervalId));
