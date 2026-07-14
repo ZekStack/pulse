@@ -49,11 +49,18 @@ struct TaskExit final : std::exception {
 };
 
 thread_local FakeTaskControl *currentTask = nullptr;
+thread_local bool holdCurrentEventWaiter = false;
 std::mutex tasksMutex;
 std::set<FakeTaskControl *> tasks;
 std::atomic<int64_t> timeOffsetUs{0};
 std::atomic<size_t> stackHighWaterMark{777};
+std::atomic<bool> notificationsSuspended{false};
 const auto clockStart = std::chrono::steady_clock::now();
+
+std::mutex heldEventMutex;
+std::condition_variable heldEventCondition;
+uint32_t heldEventWaiterCount = 0;
+bool releaseHeldEventWaiters = false;
 
 BaseType_t createTask(TaskFunction_t entry, void *arg, TaskHandle_t *handle) {
 	if (entry == nullptr || handle == nullptr) {
@@ -82,6 +89,13 @@ BaseType_t createTask(TaskFunction_t entry, void *arg, TaskHandle_t *handle) {
 		delete task;
 	}).detach();
 	return pdPASS;
+}
+
+void notifyAllTaskWaiters() {
+	std::lock_guard<std::mutex> lock(tasksMutex);
+	for (FakeTaskControl *task : tasks) {
+		task->condition.notify_all();
+	}
 }
 } // namespace
 
@@ -144,21 +158,20 @@ extern "C" uint32_t ulTaskNotifyTake(BaseType_t clearOnExit, TickType_t ticksToW
 		return 0;
 	}
 	std::unique_lock<std::mutex> lock(task->mutex);
-	if (task->notifications == 0) {
+	auto ready = [task]() {
+		return task->notifications > 0 && !notificationsSuspended.load();
+	};
+	if (!ready()) {
 		if (ticksToWait == portMAX_DELAY) {
-			task->condition.wait(lock, [task]() { return task->notifications > 0; });
+			task->condition.wait(lock, ready);
 		} else {
-			task->condition.wait_for(
-			    lock,
-			    std::chrono::milliseconds(ticksToWait),
-			    [task]() { return task->notifications > 0; }
-			);
+			task->condition.wait_for(lock, std::chrono::milliseconds(ticksToWait), ready);
 		}
 	}
-	const uint32_t result = task->notifications;
-	if (result == 0) {
+	if (!ready()) {
 		return 0;
 	}
+	const uint32_t result = task->notifications;
 	if (clearOnExit == pdTRUE) {
 		task->notifications = 0;
 	} else {
@@ -350,6 +363,16 @@ extern "C" EventBits_t xEventGroupWaitBits(
 	if (clearOnExit == pdTRUE && ready()) {
 		eventGroup->bits &= ~bitsToWaitFor;
 	}
+	lock.unlock();
+
+	if (holdCurrentEventWaiter) {
+		std::unique_lock<std::mutex> heldLock(heldEventMutex);
+		heldEventWaiterCount++;
+		heldEventCondition.notify_all();
+		heldEventCondition.wait(heldLock, []() { return releaseHeldEventWaiters; });
+		heldEventWaiterCount--;
+		holdCurrentEventWaiter = false;
+	}
 	return result;
 }
 
@@ -381,4 +404,36 @@ void fakeWakeAllTasks() {
 
 void fakeSetStackHighWaterMark(size_t bytes) {
 	stackHighWaterMark.store(bytes);
+}
+
+void fakeSuspendTaskNotifications() {
+	notificationsSuspended.store(true);
+}
+
+void fakeResumeTaskNotifications() {
+	notificationsSuspended.store(false);
+	notifyAllTaskWaiters();
+}
+
+void fakeHoldCurrentEventWaiter() {
+	std::lock_guard<std::mutex> lock(heldEventMutex);
+	releaseHeldEventWaiters = false;
+	holdCurrentEventWaiter = true;
+}
+
+bool fakeWaitForHeldEventWaiter(uint32_t timeoutMs) {
+	std::unique_lock<std::mutex> lock(heldEventMutex);
+	return heldEventCondition.wait_for(
+	    lock,
+	    std::chrono::milliseconds(timeoutMs),
+	    []() { return heldEventWaiterCount > 0; }
+	);
+}
+
+void fakeReleaseHeldEventWaiters() {
+	{
+		std::lock_guard<std::mutex> lock(heldEventMutex);
+		releaseHeldEventWaiters = true;
+	}
+	heldEventCondition.notify_all();
 }
