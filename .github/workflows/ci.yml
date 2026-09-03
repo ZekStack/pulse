@@ -22,7 +22,7 @@ env:
 
 jobs:
   source-audit:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, zekstack-ci]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -64,7 +64,7 @@ jobs:
           fi
 
   release-version-check:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, zekstack-ci]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -79,7 +79,7 @@ jobs:
           fi
 
   host-tests:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, zekstack-ci]
     needs: source-audit
     steps:
       - name: Checkout
@@ -144,7 +144,7 @@ jobs:
         run: ./build/host-tests/pulse-extended-tests callback-command-batch
 
   no-exceptions-build:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, zekstack-ci]
     needs: source-audit
     steps:
       - name: Checkout
@@ -166,7 +166,7 @@ jobs:
             -o build/no-exceptions/Pulse.o
 
   build-examples:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, zekstack-ci]
     needs: [source-audit, host-tests, no-exceptions-build, release-version-check]
     strategy:
       fail-fast: false
@@ -222,7 +222,7 @@ jobs:
             --project-option "build_flags=-std=gnu++20 -DPULSE_SMOKE_USE_PSRAM=0"
 
   arduino-cli:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, zekstack-ci]
     needs: [source-audit, host-tests, no-exceptions-build, release-version-check]
     strategy:
       fail-fast: false
@@ -300,7 +300,7 @@ jobs:
       - no-exceptions-build
       - build-examples
       - arduino-cli
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, zekstack-ci]
     permissions:
       contents: write
     steps:
