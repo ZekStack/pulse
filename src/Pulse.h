@@ -1,6 +1,8 @@
 #pragma once
 
 #include <Arduino.h>
+#include <Strata.h>
+
 #include <atomic>
 #include <cstddef>
 #include <functional>
@@ -31,12 +33,6 @@ enum class PulseStatus : uint8_t {
 	InternalError,
 };
 
-enum class PulseStackType : uint8_t {
-	Auto,
-	Internal,
-	Psram,
-};
-
 enum class PulseTimerType : uint8_t {
 	Timeout,
 	Interval,
@@ -50,10 +46,14 @@ enum class PulseTimerState : uint8_t {
 };
 
 struct PulseConfig {
+	Strata::MemoryPolicy memory{
+	    .allocation = Strata::Placement::Default,
+	    .taskStack = Strata::Placement::PreferExternal,
+	};
+
 	uint32_t stackSizeBytes = 4096;
 	UBaseType_t priority = 1;
 	BaseType_t coreId = tskNO_AFFINITY;
-	PulseStackType stackType = PulseStackType::Auto;
 	uint32_t maxTimeouts = 16;
 	uint32_t maxIntervals = 16;
 	uint32_t maxCountdowns = 8;
@@ -110,8 +110,10 @@ struct PulseDiag {
 	uint32_t droppedCommandCount = 0;
 	uint32_t lateCallbackCount = 0;
 	size_t stackHighWaterMarkBytes = 0;
-	PulseStackType requestedStackType = PulseStackType::Auto;
-	PulseStackType actualStackType = PulseStackType::Internal;
+	Strata::Placement requestedStackPlacement = Strata::Placement::Default;
+	Strata::Region stackRegion = Strata::Region::Unknown;
+	Strata::Placement commandQueueStoragePlacement = Strata::Placement::Default;
+	Strata::Region commandQueueStorageRegion = Strata::Region::Unknown;
 };
 
 class Pulse {
