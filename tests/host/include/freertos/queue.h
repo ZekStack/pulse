@@ -20,18 +20,30 @@ QueueHandle_t xQueueCreateStatic(
 );
 BaseType_t xQueueSend(QueueHandle_t queue, const void *item, TickType_t ticksToWait);
 BaseType_t xQueueReceive(QueueHandle_t queue, void *item, TickType_t ticksToWait);
-BaseType_t xQueueSendFromISR(
+UBaseType_t uxQueueMessagesWaiting(QueueHandle_t queue);
+void vQueueDelete(QueueHandle_t queue);
+
+static inline BaseType_t xQueueSendFromISR(
     QueueHandle_t queue,
     const void *item,
     BaseType_t *higherPriorityTaskWoken
-);
-BaseType_t xQueueReceiveFromISR(
+) {
+	if (higherPriorityTaskWoken != NULL) {
+		*higherPriorityTaskWoken = pdFALSE;
+	}
+	return xQueueSend(queue, item, 0);
+}
+
+static inline BaseType_t xQueueReceiveFromISR(
     QueueHandle_t queue,
     void *item,
     BaseType_t *higherPriorityTaskWoken
-);
-UBaseType_t uxQueueMessagesWaiting(QueueHandle_t queue);
-void vQueueDelete(QueueHandle_t queue);
+) {
+	if (higherPriorityTaskWoken != NULL) {
+		*higherPriorityTaskWoken = pdFALSE;
+	}
+	return xQueueReceive(queue, item, 0);
+}
 
 #ifdef __cplusplus
 }
