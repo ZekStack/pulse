@@ -10,6 +10,7 @@ struct FakeSemaphore;
 typedef struct FakeSemaphore *SemaphoreHandle_t;
 
 SemaphoreHandle_t xSemaphoreCreateRecursiveMutex(void);
+SemaphoreHandle_t xSemaphoreCreateRecursiveMutexStatic(StaticSemaphore_t *buffer);
 BaseType_t xSemaphoreTakeRecursive(SemaphoreHandle_t semaphore, TickType_t ticksToWait);
 BaseType_t xSemaphoreGiveRecursive(SemaphoreHandle_t semaphore);
 void vSemaphoreDelete(SemaphoreHandle_t semaphore);
