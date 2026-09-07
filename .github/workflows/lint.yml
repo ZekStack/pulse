@@ -12,7 +12,7 @@ permissions:
 jobs:
   metadata_lint:
     name: Metadata Lint (advisory)
-    runs-on: [self-hosted, zekstack-ci]
+    runs-on: ubuntu-latest
     continue-on-error: true
     steps:
       - name: Checkout repository
