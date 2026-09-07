@@ -7,10 +7,11 @@ void setup() {
 	Serial.begin(115200);
 
 	PulseConfig config;
+	config.memory.allocation = Strata::Placement::PreferExternal;
+	config.memory.taskStack = Strata::Placement::PreferExternal;
 	config.stackSizeBytes = 4096;
 	config.priority = 1;
 	config.coreId = tskNO_AFFINITY;
-	config.stackType = PulseStackType::Auto;
 	config.maxTimeouts = 1;
 	config.maxIntervals = 1;
 	config.maxCountdowns = 1;

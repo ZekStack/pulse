@@ -6,6 +6,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
 
 #include <atomic>
 #include <chrono>
@@ -24,6 +25,8 @@ struct FakeTaskControl {
 	std::mutex mutex;
 	std::condition_variable condition;
 	uint32_t notifications = 0;
+	bool deleteRequested = false;
+	bool exited = false;
 };
 
 struct FakeQueue {
@@ -49,7 +52,7 @@ struct TaskExit final : std::exception {
 };
 
 thread_local FakeTaskControl *currentTask = nullptr;
-thread_local bool holdCurrentEventWaiter = false;
+thread_local bool holdCurrentEndWaiter = false;
 std::mutex tasksMutex;
 std::set<FakeTaskControl *> tasks;
 std::atomic<int64_t> timeOffsetUs{0};
@@ -57,10 +60,10 @@ std::atomic<size_t> stackHighWaterMark{777};
 std::atomic<bool> notificationsSuspended{false};
 const auto clockStart = std::chrono::steady_clock::now();
 
-std::mutex heldEventMutex;
-std::condition_variable heldEventCondition;
-uint32_t heldEventWaiterCount = 0;
-bool releaseHeldEventWaiters = false;
+std::mutex heldEndMutex;
+std::condition_variable heldEndCondition;
+uint32_t heldEndWaiterCount = 0;
+bool releaseHeldEndWaiters = false;
 
 BaseType_t createTask(TaskFunction_t entry, void *arg, TaskHandle_t *handle) {
 	if (entry == nullptr || handle == nullptr) {
@@ -86,7 +89,11 @@ BaseType_t createTask(TaskFunction_t entry, void *arg, TaskHandle_t *handle) {
 			std::lock_guard<std::mutex> lock(tasksMutex);
 			tasks.erase(task);
 		}
-		delete task;
+		{
+			std::lock_guard<std::mutex> lock(task->mutex);
+			task->exited = true;
+		}
+		task->condition.notify_all();
 	}).detach();
 	return pdPASS;
 }
@@ -96,6 +103,18 @@ void notifyAllTaskWaiters() {
 	for (FakeTaskControl *task : tasks) {
 		task->condition.notify_all();
 	}
+}
+
+void holdEndWaiterIfRequested() {
+	if (!holdCurrentEndWaiter) {
+		return;
+	}
+	std::unique_lock<std::mutex> lock(heldEndMutex);
+	heldEndWaiterCount++;
+	heldEndCondition.notify_all();
+	heldEndCondition.wait(lock, []() { return releaseHeldEndWaiters; });
+	heldEndWaiterCount--;
+	holdCurrentEndWaiter = false;
 }
 } // namespace
 
@@ -122,16 +141,64 @@ extern "C" BaseType_t xTaskCreatePinnedToCore(
 	return createTask(entry, arg, handle);
 }
 
+extern "C" TaskHandle_t xTaskCreateStatic(
+    TaskFunction_t entry,
+    const char *,
+    configSTACK_DEPTH_TYPE,
+    void *arg,
+    UBaseType_t,
+    StackType_t *,
+    StaticTask_t *
+) {
+	TaskHandle_t handle = nullptr;
+	return createTask(entry, arg, &handle) == pdPASS ? handle : nullptr;
+}
+
+extern "C" TaskHandle_t xTaskCreateStaticPinnedToCore(
+    TaskFunction_t entry,
+    const char *,
+    configSTACK_DEPTH_TYPE,
+    void *arg,
+    UBaseType_t,
+    StackType_t *,
+    StaticTask_t *,
+    BaseType_t
+) {
+	TaskHandle_t handle = nullptr;
+	return createTask(entry, arg, &handle) == pdPASS ? handle : nullptr;
+}
+
 extern "C" void vTaskDelete(TaskHandle_t handle) {
 	if (handle == nullptr || handle == currentTask) {
 		throw TaskExit();
 	}
+
+	std::unique_lock<std::mutex> lock(handle->mutex);
+	handle->deleteRequested = true;
+	handle->condition.notify_all();
+	handle->condition.wait(lock, [handle]() { return handle->exited; });
 }
 
 extern "C" void vTaskDelay(TickType_t ticks) {
+	holdEndWaiterIfRequested();
+
+	if (currentTask != nullptr) {
+		std::lock_guard<std::mutex> lock(currentTask->mutex);
+		if (currentTask->deleteRequested) {
+			throw TaskExit();
+		}
+	}
+
 	if (ticks == portMAX_DELAY) {
-		std::this_thread::sleep_for(24h);
-		return;
+		if (currentTask == nullptr) {
+			std::this_thread::sleep_for(24h);
+			return;
+		}
+		std::unique_lock<std::mutex> lock(currentTask->mutex);
+		currentTask->condition.wait(lock, []() {
+			return currentTask != nullptr && currentTask->deleteRequested;
+		});
+		throw TaskExit();
 	}
 	std::this_thread::sleep_for(std::chrono::milliseconds(ticks));
 }
@@ -146,6 +213,9 @@ extern "C" BaseType_t xTaskNotifyGive(TaskHandle_t handle) {
 	}
 	{
 		std::lock_guard<std::mutex> lock(handle->mutex);
+		if (handle->deleteRequested) {
+			return pdFAIL;
+		}
 		handle->notifications++;
 	}
 	handle->condition.notify_all();
@@ -159,7 +229,8 @@ extern "C" uint32_t ulTaskNotifyTake(BaseType_t clearOnExit, TickType_t ticksToW
 	}
 	std::unique_lock<std::mutex> lock(task->mutex);
 	auto ready = [task]() {
-		return task->notifications > 0 && !notificationsSuspended.load();
+		return task->deleteRequested ||
+		       (task->notifications > 0 && !notificationsSuspended.load());
 	};
 	if (!ready()) {
 		if (ticksToWait == portMAX_DELAY) {
@@ -167,6 +238,9 @@ extern "C" uint32_t ulTaskNotifyTake(BaseType_t clearOnExit, TickType_t ticksToW
 		} else {
 			task->condition.wait_for(lock, std::chrono::milliseconds(ticksToWait), ready);
 		}
+	}
+	if (task->deleteRequested) {
+		throw TaskExit();
 	}
 	if (!ready()) {
 		return 0;
@@ -192,6 +266,15 @@ extern "C" QueueHandle_t xQueueCreate(UBaseType_t length, UBaseType_t itemSize) 
 	queue->capacity = length;
 	queue->itemSize = itemSize;
 	return queue;
+}
+
+extern "C" QueueHandle_t xQueueCreateStatic(
+    UBaseType_t length,
+    UBaseType_t itemSize,
+    uint8_t *,
+    StaticQueue_t *
+) {
+	return xQueueCreate(length, itemSize);
 }
 
 extern "C" BaseType_t xQueueSend(
@@ -273,6 +356,10 @@ extern "C" SemaphoreHandle_t xSemaphoreCreateRecursiveMutex(void) {
 	return new (std::nothrow) FakeSemaphore();
 }
 
+extern "C" SemaphoreHandle_t xSemaphoreCreateRecursiveMutexStatic(StaticSemaphore_t *) {
+	return new (std::nothrow) FakeSemaphore();
+}
+
 extern "C" BaseType_t xSemaphoreTakeRecursive(
     SemaphoreHandle_t semaphore,
     TickType_t ticksToWait
@@ -301,6 +388,22 @@ extern "C" BaseType_t xSemaphoreGiveRecursive(SemaphoreHandle_t semaphore) {
 
 extern "C" void vSemaphoreDelete(SemaphoreHandle_t semaphore) {
 	delete semaphore;
+}
+
+extern "C" BaseType_t xTimerPendFunctionCall(
+    PendedFunction_t function,
+    void *parameter1,
+    uint32_t parameter2,
+    TickType_t
+) {
+	if (function == nullptr) {
+		return pdFAIL;
+	}
+	std::thread([function, parameter1, parameter2]() {
+		std::this_thread::sleep_for(1ms);
+		function(parameter1, parameter2);
+	}).detach();
+	return pdPASS;
 }
 
 extern "C" EventGroupHandle_t xEventGroupCreate(void) {
@@ -364,16 +467,6 @@ extern "C" EventBits_t xEventGroupWaitBits(
 	if (clearOnExit == pdTRUE && completed) {
 		eventGroup->bits &= ~bitsToWaitFor;
 	}
-	lock.unlock();
-
-	if (holdCurrentEventWaiter && completed) {
-		std::unique_lock<std::mutex> heldLock(heldEventMutex);
-		heldEventWaiterCount++;
-		heldEventCondition.notify_all();
-		heldEventCondition.wait(heldLock, []() { return releaseHeldEventWaiters; });
-		heldEventWaiterCount--;
-		holdCurrentEventWaiter = false;
-	}
 	return result;
 }
 
@@ -421,25 +514,25 @@ void fakeResumeTaskNotifications() {
 	notifyAllTaskWaiters();
 }
 
-void fakeHoldCurrentEventWaiter() {
-	std::lock_guard<std::mutex> lock(heldEventMutex);
-	releaseHeldEventWaiters = false;
-	holdCurrentEventWaiter = true;
+void fakeHoldCurrentEndWaiter() {
+	std::lock_guard<std::mutex> lock(heldEndMutex);
+	releaseHeldEndWaiters = false;
+	holdCurrentEndWaiter = true;
 }
 
-bool fakeWaitForHeldEventWaiter(uint32_t timeoutMs) {
-	std::unique_lock<std::mutex> lock(heldEventMutex);
-	return heldEventCondition.wait_for(
+bool fakeWaitForHeldEndWaiter(uint32_t timeoutMs) {
+	std::unique_lock<std::mutex> lock(heldEndMutex);
+	return heldEndCondition.wait_for(
 	    lock,
 	    std::chrono::milliseconds(timeoutMs),
-	    []() { return heldEventWaiterCount > 0; }
+	    []() { return heldEndWaiterCount > 0; }
 	);
 }
 
-void fakeReleaseHeldEventWaiters() {
+void fakeReleaseHeldEndWaiters() {
 	{
-		std::lock_guard<std::mutex> lock(heldEventMutex);
-		releaseHeldEventWaiters = true;
+		std::lock_guard<std::mutex> lock(heldEndMutex);
+		releaseHeldEndWaiters = true;
 	}
-	heldEventCondition.notify_all();
+	heldEndCondition.notify_all();
 }

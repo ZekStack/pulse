@@ -1,23 +1,27 @@
 # Pulse
 
-Pulse is a millisecond timer library for ESP32.
+Pulse is a millisecond timer library for ESP32. It schedules short runtime timeouts, intervals, and countdowns from one internal FreeRTOS task using monotonic uptime, so NTP sync, timezone changes, DST, and wall-clock corrections do not affect timer deadlines.
 
-Pulse helps you schedule short runtime timeouts, intervals, and countdowns in Arduino ESP32 projects. It is designed for uptime-based timing that should not be affected by NTP sync, timezone changes, DST changes, or system date corrections.
+Pulse `v0.2.0` uses [Strata](https://github.com/ZekStack/strata) for memory placement and owned FreeRTOS storage.
 
 [![CI](https://github.com/ZekStack/pulse/actions/workflows/ci.yml/badge.svg)](https://github.com/ZekStack/pulse/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/ZekStack/pulse?sort=semver)](https://github.com/ZekStack/pulse/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE.md)
 
-## Why use Pulse?
+## Highlights
 
-* **Uptime timers** - all timing is based on ESP-IDF's monotonic runtime timer.
-* **One task** - timeouts, intervals, and countdowns are coordinated by one internal Pulse task.
-* **Bounded counts** - configured limits cap each timer type and the command queue.
-* **Task-side callbacks** - callbacks run from the internal Pulse task.
-* **Lifecycle-safe shutdown** - shutdown is independent of command-queue capacity and may be retried after a timeout.
-* **Production-minded** - result-based errors, synchronized lifecycle operations, diagnostics, and no explicit exceptions.
+- **Monotonic uptime timers** — timeouts, intervals, and countdowns use ESP-IDF runtime time.
+- **One scheduler task** — callbacks execute serially from one internal Pulse task.
+- **Bounded scheduling storage** — timer counts and command-queue capacity are configured up front.
+- **Shared memory policy** — `Strata::MemoryPolicy` controls general Pulse-owned allocation and task-stack placement.
+- **Strata-owned FreeRTOS storage** — scheduler stack/TCB, recursive mutex storage, and command queue storage use static Strata ownership.
+- **Lifecycle-safe shutdown** — scheduler task deletion happens from another FreeRTOS task context after quiescence.
+- **Generation-safe reuse** — stale `end()` waiters cannot affect a newer Pulse lifecycle.
+- **Runtime diagnostics** — timer/queue counters plus requested placement and observed memory region.
 
-## Install
+## Dependency
+
+Pulse `v0.2.0` requires Strata `v0.1.2`.
 
 ### PlatformIO
 
@@ -28,7 +32,7 @@ board = esp32dev
 framework = arduino
 
 lib_deps =
-  https://github.com/ZekStack/pulse.git
+  https://github.com/ZekStack/pulse.git#v0.2.0
 
 build_flags =
   -std=gnu++20
@@ -36,13 +40,14 @@ build_unflags =
   -std=gnu++11
 ```
 
+Pulse's `library.json` pins Strata, so PlatformIO resolves it transitively.
+
 ### Arduino IDE
 
-Pulse is not published to Arduino Library Manager yet.
+Pulse and Strata are not published to Arduino Library Manager yet. Install both repositories into the Arduino libraries directory:
 
-Install it by downloading the repository ZIP or cloning it into your Arduino libraries folder.
-
-```txt
+```text
+Arduino/libraries/Strata
 Arduino/libraries/Pulse
 ```
 
@@ -82,62 +87,93 @@ void loop() {
 }
 ```
 
-## Important notes
+## Memory policy
+
+Pulse uses the same memory-policy shape as other Strata-backed ZekStack libraries:
+
+```cpp
+PulseConfig config;
+config.memory.allocation = Strata::Placement::PreferExternal;
+config.memory.taskStack = Strata::Placement::PreferExternal;
+
+PulseResult result = pulse.init(config);
+```
+
+`memory.allocation` controls movable Pulse-owned storage, including timer records, `shared_ptr` control blocks, bounded timer-registry backing, and command-queue item storage. `memory.taskStack` controls the scheduler task stack.
+
+Defaults:
+
+```text
+allocation = Strata::Placement::Default
+taskStack  = Strata::Placement::PreferExternal
+```
+
+`PreferExternal` falls back to internal memory. `RequireExternal` fails instead of consuming internal memory when external memory is unavailable. Strata keeps FreeRTOS control blocks internal.
+
+## Diagnostics
+
+Requested memory policy and observed memory location are intentionally separate:
+
+```cpp
+PulseDiag diag = pulse.getDiagnostics();
+
+Serial.printf(
+    "stack=%s/%s queue=%s/%s\n",
+    Strata::toString(diag.requestedStackPlacement),
+    Strata::toString(diag.stackRegion),
+    Strata::toString(diag.commandQueueStoragePlacement),
+    Strata::toString(diag.commandQueueStorageRegion)
+);
+```
+
+`requestedStackPlacement` is what the application asked for. `stackRegion` is where Strata actually placed the scheduler stack. With `PreferExternal`, those can differ when Pulse falls back to internal memory.
+
+## Important behavior
 
 > [!IMPORTANT]
 > Pulse callbacks run from the internal Pulse task. Keep callbacks short and offload long-running work to Worker.
 
-* `setInterval()` uses delay-after-callback timing and does not catch up missed ticks.
-* Countdown callbacks first run after `tickMs`; the final callback is guaranteed with `isFinished=true`.
-* `clear()`, `pause()`, `resume()`, and `restart()` enqueue nonblocking control commands.
-* A control that returns success is accepted for the current running lifecycle generation. Shutdown supersedes pending timer controls.
-* Controls queued by a callback are processed before another already-due timer is selected.
-* A timeout and a final countdown are terminal before their callback runs. Controls for that timer return `TimerNotFound` from the terminal callback.
-* Calling `end()` from a Pulse callback returns `PulseStatus::Busy` because the task cannot wait for itself.
-* If `end(timeoutMs)` returns `Timeout`, shutdown remains requested. Call `end()` again to continue waiting.
-* Destroying Pulse from another task waits until the scheduler is quiesced. Callbacks must eventually return.
-* Zero-millisecond timer values are rejected.
-* Stack sizes are FreeRTOS byte sizes on ESP32 and must be at least 1024 bytes.
-* Stack high-water diagnostics use the ESP-IDF byte value directly.
-* `PulseStackType::Auto` prefers PSRAM task stacks when supported and falls back to internal RAM.
+- `setInterval()` uses delay-after-callback timing and does not catch up missed ticks.
+- Countdown callbacks first run after `tickMs`; the final callback is guaranteed with `isFinished=true`.
+- `clear()`, `pause()`, `resume()`, and `restart()` enqueue nonblocking controls.
+- Callback-generated controls are processed before another already-due timer is selected.
+- A timeout and final countdown are removed before their terminal callback; controls for that timer return `TimerNotFound`.
+- Calling `end()` from a Pulse callback returns `PulseStatus::Busy` because the scheduler cannot wait for itself.
+- If `end(timeoutMs)` returns `Timeout`, shutdown remains requested; call `end()` again to continue waiting.
+- Destroying Pulse from another task waits until the scheduler quiesces and is externally reaped.
+- Destroying Pulse from its own callback remains supported; final Strata task deletion is deferred to the FreeRTOS timer-service task.
+- Zero-millisecond timer values are rejected.
+- Stack sizes are FreeRTOS byte sizes on ESP32 and must be at least 1024 bytes and aligned to `sizeof(StackType_t)`.
 
-## Timing guarantees
+## Lifecycle and task ownership
 
-Pulse uses ESP-IDF's 64-bit monotonic runtime timer internally. It is intended for short runtime timers, not wall-clock scheduling.
+Each successful `init()` starts a new lifecycle generation. The scheduler runs until shutdown is requested, releases timer and queue resources, then reaches a quiescent handoff. `end()` claims that generation's reap, calls `Strata::FreeRTOS::Task::reset()` from an external task context, and only then makes Pulse reusable.
 
-## Threading and lifecycle model
+This external deletion is required because Strata owns the scheduler's static task stack and task control block. Concurrent and stale `end()` waiters are generation-checked before they can reap anything.
 
-All callbacks run from the internal Pulse task. Timer creation and control methods synchronize against initialization and shutdown.
+## Memory and exception boundary
 
-Each successful `init()` begins a new internal lifecycle generation. `end()` targets the generation that was running when the call began. A delayed waiter from an older generation cannot stop a newer run.
+Pulse routes storage it directly owns through Strata. That includes the implementation object, timer registry backing, timer records, shared ownership control blocks created by Pulse, scheduler task storage, recursive mutex control storage, and command queue storage.
 
-The internal lifecycle is:
+`std::function` remains the public callback surface. Allocation performed by the standard library or caller while constructing/copying user callback captures is outside Pulse's direct ownership boundary. The CI no-exceptions build proves compilation compatibility; it does not claim every standard-library allocation failure is recoverable.
 
-```txt
-Uninitialized -> Running -> Stopping -> Stopped -> Uninitialized
+## Configuration
+
+```cpp
+PulseConfig config;
+config.memory.allocation = Strata::Placement::Default;
+config.memory.taskStack = Strata::Placement::PreferExternal;
+config.stackSizeBytes = 4096;
+config.priority = 1;
+config.coreId = tskNO_AFFINITY;
+config.maxTimeouts = 16;
+config.maxIntervals = 16;
+config.maxCountdowns = 8;
+config.commandQueueSize = 20;
+config.taskName = "pulse-task";
 ```
 
-`Stopping` means shutdown was requested but an active callback or scheduler cleanup may still be in progress. Timer creation and controls return `Busy` in this state. Diagnostics remain available.
-
-`Stopped` means scheduler resources are quiesced and the scheduler task will no longer access them. Physical FreeRTOS task deletion follows using task-local values. A waiting `end()` then completes public lifecycle finalization.
-
-Shutdown has a dedicated task wakeup and does not use the bounded command queue.
-
-## Callback control semantics
-
-Controls from interval and non-final countdown callbacks are applied after the callback returns and before another due timer is dispatched.
-
-An interval that pauses itself resumes after a complete interval. A non-final countdown that pauses itself preserves the delay until its next countdown tick.
-
-Timeouts and final countdowns are removed from the registry before their terminal callback. Their own `clear()`, `pause()`, `resume()`, and `restart()` calls therefore return `TimerNotFound`.
-
-## Memory and exception model
-
-Pulse does not explicitly throw exceptions. Internal Pulse allocations use checked non-throwing allocation where practical.
-
-Timer records, `shared_ptr` control blocks, user callbacks, and `std::function` captures may allocate. Construction and storage of user-provided callbacks follow the standard-library and toolchain allocation behavior. A build with exceptions disabled proves compilation compatibility; it does not guarantee graceful failure for every standard-library allocation.
-
-Fully fixed-capacity callback and timer-record storage may be introduced in a later release.
+See [`docs/configuration.md`](docs/configuration.md) for details.
 
 ## Examples
 
@@ -146,50 +182,33 @@ Fully fixed-capacity callback and timer-record storage may be introduced in a la
 | `Basic` | Minimal init, timeout, interval, and clear. |
 | `Countdown` | Countdown ticks and final completion callback. |
 | `PauseResumeRestart` | Timer pause, resume, restart, and state checks. |
-| `ConfigAndLimits` | Stack, queue, and timer limit configuration. |
-| `Diagnostics` | Runtime counters and queue diagnostics. |
+| `ConfigAndLimits` | Strata memory policy, task settings, queue, and timer limits. |
+| `Diagnostics` | Runtime counters plus Strata placement and region diagnostics. |
 | `BindableCallbacks` | `std::bind` with private class methods. |
-
-Start with:
-
-```txt
-examples/Basic
-```
 
 ## Documentation
 
-Detailed documentation is available in the `docs/` folder.
-
 | Document | Description |
 | --- | --- |
-| [`docs/getting-started.md`](docs/getting-started.md) | Step-by-step setup and first timer flow. |
-| [`docs/configuration.md`](docs/configuration.md) | Config options, limits, stack behavior, and queue sizing. |
-| [`docs/api.md`](docs/api.md) | Public classes, lifecycle, timer controls, and diagnostics. |
-| [`docs/examples.md`](docs/examples.md) | Explanation of all included examples. |
-| [`docs/troubleshooting.md`](docs/troubleshooting.md) | Common issues and solutions. |
+| [`docs/getting-started.md`](docs/getting-started.md) | Dependency setup, first timers, and memory policy. |
+| [`docs/configuration.md`](docs/configuration.md) | Memory placement, task settings, limits, and queue sizing. |
+| [`docs/api.md`](docs/api.md) | Public API, lifecycle, diagnostics, and v0.1.0 migration mapping. |
+| [`docs/examples.md`](docs/examples.md) | Included examples. |
+| [`docs/troubleshooting.md`](docs/troubleshooting.md) | Lifecycle, placement, and common runtime issues. |
 
-## API overview
+## Migrating from v0.1.0
 
-```cpp
-Pulse pulse;
-pulse.init();
+Pulse `v0.2.0` intentionally adopts the shared Strata vocabulary instead of retaining Pulse-specific aliases:
 
-PulseTimerResult timeout = pulse.setTimeout([]() {}, 1000);
-PulseTimerResult interval = pulse.setInterval([]() {}, 1000);
+| v0.1.0 | v0.2.0 |
+| --- | --- |
+| `PulseStackType::Auto` | `Strata::Placement::PreferExternal` |
+| `PulseStackType::Internal` | `Strata::Placement::Internal` |
+| `PulseStackType::Psram` | `Strata::Placement::RequireExternal` |
+| `config.stackType` | `config.memory.taskStack` |
+| no general allocation policy | `config.memory.allocation` |
 
-PulseCountdownConfig countdown;
-countdown.durationMs = 10000;
-countdown.tickMs = 1000;
-pulse.setCountdown(countdown, [](const PulseCountdownTick &tick) {});
-
-pulse.pause(interval.id);
-pulse.resume(interval.id);
-pulse.clear(interval.id);
-
-PulseDiag diag = pulse.getDiagnostics();
-```
-
-For the full API, see [`docs/api.md`](docs/api.md).
+The default v0.2.0 task-stack policy preserves the old `Auto` behavior.
 
 ## Compatibility
 
@@ -198,49 +217,15 @@ For the full API, see [`docs/api.md`](docs/api.md).
 | Framework | Arduino ESP32 |
 | Platform | `espressif32` |
 | Language | C++20 |
-| Filesystem | none |
-| PSRAM | Optional for task stacks when ESP-IDF support is available |
-| Dependencies | none |
-| Exceptions | No explicit throws; `std::function` follows toolchain behavior |
-| Status | `0.1.0` release candidate |
-
-## Configuration
-
-```cpp
-PulseConfig config;
-config.stackSizeBytes = 4096;
-config.priority = 1;
-config.coreId = tskNO_AFFINITY;
-config.stackType = PulseStackType::Auto;
-config.maxTimeouts = 16;
-config.maxIntervals = 16;
-config.maxCountdowns = 8;
-config.commandQueueSize = 20;
-
-PulseResult result = pulse.init(config);
-```
-
-For all options, see [`docs/configuration.md`](docs/configuration.md).
-
-## Error handling
-
-Pulse reports operation status through `PulseResult` and `PulseTimerResult`.
-
-```cpp
-PulseTimerResult result = pulse.setTimeout([]() {}, 1000);
-
-if (!result) {
-	Serial.println(result.message);
-	return;
-}
-```
-
-For result fields and status codes, see [`docs/api.md`](docs/api.md).
+| Strata | `v0.1.2` |
+| PSRAM | Optional through Strata placement policy |
+| Exceptions | No explicit throws; callback/STL allocation follows toolchain behavior |
+| CI targets | ESP32, ESP32-S3, ESP32-C3, ESP32-P4 |
 
 ## License
 
-MIT - see [`LICENSE.md`](LICENSE.md).
+MIT — see [`LICENSE.md`](LICENSE.md).
 
 ## ZekStack
 
-Part of the ZekStack ESP32 library stack.
+Part of the ZekStack ESP32 library stack. Pulse follows the shared Strata memory-policy contract used by higher-level ZekStack libraries.

@@ -14,11 +14,11 @@ Schedules a timer, pauses it, resumes it, restarts it, and prints timer state.
 
 ## ConfigAndLimits
 
-Configures stack, queue, and per-type timer limits. Demonstrates a clean limit failure.
+Configures `Strata::MemoryPolicy`, scheduler task settings, command queue size, and per-type timer limits. It also demonstrates a clean timer-limit failure.
 
 ## Diagnostics
 
-Prints `PulseDiag` fields while timers run.
+Prints runtime `PulseDiag` counters together with requested Strata placement and observed stack/command-queue storage regions.
 
 ## BindableCallbacks
 

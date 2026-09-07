@@ -1,18 +1,26 @@
 # Troubleshooting
 
-## Timer creation fails
+## `init()` fails
 
-Check `PulseTimerResult::message` and `PulseTimerResult::status`.
+Check `PulseResult::status` and `PulseResult::message`.
+
+Common causes include an invalid stack size, zero queue/timer capacity, invalid Strata placement, allocation failure, or scheduler task creation failure.
+
+If `memory.taskStack` is `Strata::Placement::RequireExternal`, `TaskCreateFailed` is expected when external memory is unavailable. If `memory.allocation` is `RequireExternal`, Pulse may return `OutOfMemory` while allocating bounded timer storage before the scheduler task is created.
+
+Use `PreferExternal` when fallback to internal memory is acceptable.
+
+## Timer creation fails
 
 Common causes:
 
-* Pulse was not initialized.
-* Pulse is stopping or stopped and the operation returned `Busy`.
-* A callback was missing.
-* A delay, interval, duration, or tick value was zero.
-* A per-type timer limit was reached.
-* The total configured timer capacity was zero or overflowed.
-* The command queue was full.
+- Pulse was not initialized.
+- Pulse is stopping, quiesced, or being reaped and the operation returned `Busy`.
+- A callback was missing.
+- A delay, interval, duration, or tick value was zero.
+- A per-type timer limit was reached.
+- The command queue was full.
+- Strata could not allocate the timer record/control block under the configured `memory.allocation` policy.
 
 ## Countdown does not start immediately
 
@@ -26,15 +34,11 @@ Pulse intervals use delay-after-callback timing. The next interval is scheduled 
 
 Increase `PulseConfig::commandQueueSize` or reduce bursts of `clear()`, `pause()`, `resume()`, and `restart()` calls.
 
-Timer-control queue sends are nonblocking. Queue-full operations return `QueueFull` immediately.
-
-Shutdown has a separate wake mechanism and does not depend on command-queue capacity.
+Timer-control sends are nonblocking. Queue-full operations return `QueueFull` immediately. Shutdown uses the task notification path and does not depend on queue capacity.
 
 ## State did not change immediately
 
-This is expected after `clear()`, `pause()`, `resume()`, and `restart()`. A successful result means the command was queued for the current running lifecycle generation, not necessarily already applied.
-
-While Pulse remains in that generation, callback-generated controls are processed before another due timer is selected. Shutdown supersedes pending timer controls.
+This is expected after `clear()`, `pause()`, `resume()`, and `restart()`. Success means the command was queued for the current lifecycle generation, not necessarily already applied.
 
 ## A terminal callback cannot restart its timer
 
@@ -44,21 +48,25 @@ Restart or pause a countdown from a non-final tick instead.
 
 ## `end()` returns `Busy` from a callback
 
-All callbacks run on the Pulse task. That task cannot synchronously wait for itself, so callback-side `end()` returns `Busy`.
+All callbacks run on the Pulse scheduler task. That task cannot synchronously reap its own Strata-owned task storage, so callback-side `end()` returns `Busy`.
 
-Request shutdown from another task after the callback returns. Pulse does not expose a public asynchronous stop API in v0.1.0.
+Destroying the Pulse object from its callback remains supported in `v0.2.0`: teardown is marked orphaned and final task reaping is deferred to the FreeRTOS timer-service task after the scheduler quiesces.
 
 ## `end()` returns `Timeout`
 
-The timeout does not cancel shutdown and does not release scheduler resources prematurely. Pulse remains in the stopping state.
+The timeout does not cancel shutdown or release scheduler resources prematurely. Pulse remains in the stopping lifecycle for that generation.
 
-Allow the active callback to return, then call `end()` again. Diagnostics remain available while shutdown is pending.
+Allow the active callback to return, then call `end()` again. A stale waiter from an older generation cannot reap a newer scheduler task.
 
 ## Destruction blocks
 
-Destroying Pulse from another task waits until the scheduler is quiesced. A callback that never returns can therefore block destruction indefinitely.
+Destroying Pulse from another task waits until the scheduler is quiesced and externally reaped. A callback that never returns can therefore block destruction indefinitely.
 
 Callbacks must eventually return. Offload long-running or blocking work to Worker.
+
+## Requested placement and region differ
+
+This is normal with `Strata::Placement::PreferExternal`. `PulseDiag::requestedStackPlacement` and `commandQueueStoragePlacement` report policy, while `stackRegion` and `commandQueueStorageRegion` report the observed memory region. External-preferred allocation may fall back to internal memory.
 
 ## Callback blocks other timers
 

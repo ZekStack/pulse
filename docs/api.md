@@ -1,12 +1,12 @@
 # API Reference
 
-This page summarizes the public API declared in `src/Pulse.h`.
+This page summarizes the public API declared in `src/Pulse.h` for Pulse `v0.2.0`.
 
 ## Results
 
 Pulse does not explicitly throw exceptions. Operations return `PulseResult` or `PulseTimerResult`.
 
-Internal Pulse allocations use checked non-throwing allocation where practical. User-provided `std::function` callbacks and captures follow the standard-library and toolchain allocation behavior.
+Pulse-owned allocation routes through Strata where Pulse controls the storage. User-provided `std::function` callbacks and captures still follow standard-library and toolchain allocation behavior.
 
 | Field | Meaning |
 | --- | --- |
@@ -17,12 +17,32 @@ Internal Pulse allocations use checked non-throwing allocation where practical. 
 
 `PulseStatus` values are `Ok`, `NotInitialized`, `AlreadyInitialized`, `InvalidArgument`, `OutOfMemory`, `TaskCreateFailed`, `QueueCreateFailed`, `TimerNotFound`, `QueueFull`, `Busy`, `Timeout`, and `InternalError`.
 
+## PulseConfig
+
+```cpp
+PulseConfig config;
+config.memory.allocation = Strata::Placement::PreferExternal;
+config.memory.taskStack = Strata::Placement::PreferExternal;
+config.stackSizeBytes = 4096;
+config.priority = 1;
+config.coreId = tskNO_AFFINITY;
+config.maxTimeouts = 16;
+config.maxIntervals = 16;
+config.maxCountdowns = 8;
+config.commandQueueSize = 20;
+config.taskName = "pulse-task";
+```
+
+`memory.allocation` controls movable Pulse-owned storage such as timer records, bounded timer slot backing, and command-queue item storage. `memory.taskStack` controls the scheduler task stack. Strata keeps the relevant FreeRTOS control blocks internal.
+
+The default task-stack policy is `Strata::Placement::PreferExternal`, which preserves Pulse `v0.1.0`'s old `PulseStackType::Auto` behavior.
+
 ## Pulse
 
 | Method | Purpose |
 | --- | --- |
-| `init(config)` | Allocate scheduler resources and start a new lifecycle generation. |
-| `end(timeoutMs)` | Request shutdown and wait for the targeted lifecycle generation to quiesce. |
+| `init(config)` | Allocate Strata-backed scheduler resources and start a new lifecycle generation. |
+| `end(timeoutMs)` | Request shutdown and externally reap the targeted scheduler task after it quiesces. |
 | `setTimeout(callback, delayMs)` | Run a callback once after a delay. |
 | `setInterval(callback, intervalMs)` | Run a callback repeatedly with delay-after-callback timing. |
 | `setCountdown(config, callback)` | Run countdown tick callbacks until completion. |
@@ -34,48 +54,39 @@ Internal Pulse allocations use checked non-throwing allocation where practical. 
 | `resume(id)` | Queue resuming a paused timer. |
 | `restart(id)` | Queue restarting a timer from its original delay, interval, or countdown duration. |
 | `getState(id)` | Return `Running`, `Paused`, or `NotFound`. |
-| `getDiagnostics()` | Return aggregate counts and task diagnostics. |
+| `getDiagnostics()` | Return aggregate timer, queue, task-stack, and Strata placement diagnostics. |
 
 ## Lifecycle
 
-Pulse internally uses these states:
+The public lifecycle remains equivalent to:
 
-```txt
-Uninitialized -> Running -> Stopping -> Stopped -> Uninitialized
+```text
+Uninitialized -> Running -> Stopping -> Uninitialized
 ```
 
-Each successful `init()` begins a new lifecycle generation. An `end()` call captures the generation it intends to stop. If another caller completes shutdown and a new generation starts before an older waiter wakes, that older waiter returns success without affecting the new run.
+Internally, Pulse `v0.2.0` adds `Quiesced` and `Reaping` handoff states. The scheduler task first stops dispatching work and releases scheduler-owned timer/queue storage. Another FreeRTOS task context then resets the `Strata::FreeRTOS::Task`, which deletes the scheduler and releases its static stack and task control block.
 
-`init()` is allowed only from `Uninitialized`.
+Each successful `init()` begins a new lifecycle generation. An `end()` call captures the generation it intends to stop. If another caller completes shutdown and a newer generation starts before an older waiter resumes, that stale waiter returns success without touching the new scheduler.
 
-During `Stopping` and `Stopped`:
-
-- timer creation and controls return `Busy`;
-- `init()` returns `Busy`;
-- `getDiagnostics()` remains available;
-- `getState()` may report timer state until scheduler storage is detached, then returns `NotFound`.
-
-`Stopped` means the scheduler is quiesced, callback storage has been detached or destroyed, and the scheduler task will no longer access scheduler resources. Physical FreeRTOS task deletion follows immediately using task-local values.
+`init()` is accepted only from the internally uninitialized state. During stopping, quiescing, or reaping, timer creation and controls return `Busy`, and a new `init()` also returns `Busy`.
 
 ## Shutdown
 
-Shutdown does not use the bounded command queue. It sets the lifecycle to `Stopping` and wakes the Pulse task through its dedicated task notification.
+Shutdown does not depend on bounded command-queue capacity. It changes the lifecycle to stopping and wakes the Pulse task through its task notification.
 
-If `end(timeoutMs)` returns `Timeout`, shutdown remains requested. The object remains valid in `Stopping`, diagnostics remain available, and a later `end()` continues waiting.
+If `end(timeoutMs)` returns `Timeout`, shutdown remains requested. A later `end()` continues waiting for the same lifecycle generation.
 
-Calling `end()` from the Pulse task, including from a callback, returns `Busy`. A task cannot synchronously wait for itself.
+Calling `end()` from the Pulse task, including from a callback, returns `PulseStatus::Busy` because the scheduler cannot synchronously wait for itself.
 
-Destroying Pulse from another task uses join-style behavior: it requests shutdown and waits without a timeout until the scheduler is quiesced. Callbacks must eventually return.
+Destroying Pulse from another task uses join-style behavior and waits until the scheduler can be reaped. Destroying Pulse from one of its own callbacks is also supported: Pulse marks the implementation orphaned, allows the scheduler to quiesce, and defers the Strata task reset to the FreeRTOS timer-service task.
 
 ## Queued controls
 
-`clear()`, `pause()`, `resume()`, and `restart()` use nonblocking queue sends while holding lifecycle protection. Queue-full operations fail immediately with `QueueFull`.
+`clear()`, `pause()`, `resume()`, and `restart()` use nonblocking sends to a `Strata::FreeRTOS::Queue<PulseCommand>`. Queue item storage follows `PulseConfig::memory.allocation`; the FreeRTOS queue control block is internal.
 
-A successful result means the control was accepted for the current running lifecycle generation. While Pulse remains in that generation, controls already queued when a callback completes are processed before another due timer is selected.
+A successful result means the control was accepted for the current running lifecycle generation. Controls already queued when a callback completes are processed before another due timer is selected.
 
-Shutdown supersedes pending timer operations. A control queued immediately before shutdown may be discarded because scheduler cleanup removes all timers.
-
-Calling `getState()` immediately after a queued control may still show the previous state until the Pulse task processes it.
+Shutdown supersedes pending timer operations. Calling `getState()` immediately after a queued control may still show the previous state until the scheduler processes it.
 
 ## Callback controls
 
@@ -83,13 +94,11 @@ Intervals and non-final countdowns remain registered while their callbacks execu
 
 Controls queued during one of those callbacks are applied before default rescheduling. Pulse uses a timer mutation generation so restart, pause, resume, or clear cannot be overwritten by unconditional post-callback scheduling.
 
-An interval that pauses itself preserves a full interval before the next callback after resume.
-
-A non-final countdown that pauses itself preserves `min(tickMs, remainingMs)` before the next countdown tick after resume.
+An interval that pauses itself preserves a full interval before the next callback after resume. A non-final countdown that pauses itself preserves `min(tickMs, remainingMs)` before the next countdown tick after resume.
 
 A timeout is removed before its callback runs. A countdown is removed before its final callback. Controls targeting those terminal timers return `TimerNotFound`.
 
-A callback may clear another timer that is already due. The queued clear is processed before Pulse selects the next due timer.
+A callback may clear another timer that is already due; that clear is processed before Pulse selects the next due timer.
 
 ## Countdown ticks
 
@@ -107,8 +116,25 @@ The first callback runs after `tickMs`. The final callback is guaranteed with `r
 
 ## Diagnostics
 
-`PulseDiag` reports timer counts, running and paused counts, command queue size and usage, callback counters, late callback count, stack high-water mark, and requested/actual stack type.
+`PulseDiag` reports:
 
-While the scheduler task is active, the stack high-water mark is queried while the lifecycle mutex protects the task handle. After scheduler cleanup, the last stored value is returned.
+- timer counts and running/paused counts;
+- command queue size/usage;
+- callback, late-callback, and dropped-command counters;
+- `stackHighWaterMarkBytes`;
+- `requestedStackPlacement` and observed `stackRegion`;
+- `commandQueueStoragePlacement` and observed `commandQueueStorageRegion`.
 
-ESP-IDF reports `uxTaskGetStackHighWaterMark()` in bytes. Pulse returns that value directly without multiplying it by `sizeof(StackType_t)`.
+The requested placement is policy; the region is the actual storage location reported by Strata. With `PreferExternal`, the requested placement can remain external-preferred even when the observed region is internal after fallback.
+
+While the scheduler is active, stack high-water data comes from `Strata::FreeRTOS::Task`. After quiescence, Pulse retains the final byte-normalized value.
+
+## v0.1.0 to v0.2.0 migration
+
+| Pulse v0.1.0 | Pulse v0.2.0 |
+| --- | --- |
+| `PulseStackType::Auto` | `Strata::Placement::PreferExternal` |
+| `PulseStackType::Internal` | `Strata::Placement::Internal` |
+| `PulseStackType::Psram` | `Strata::Placement::RequireExternal` |
+| `config.stackType` | `config.memory.taskStack` |
+| no general allocation policy | `config.memory.allocation` |

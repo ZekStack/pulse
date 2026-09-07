@@ -1,29 +1,34 @@
 #include "Pulse.h"
 
-#include "internal/PulseMutex.h"
-#include "internal/PulseTaskSupport.h"
+#include <strata/freertos/Mutex.h>
+#include <strata/freertos/Queue.h>
+#include <strata/freertos/Task.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <memory>
-#include <new>
+#include <type_traits>
 #include <utility>
 
 #include <esp_timer.h>
-#include <freertos/event_groups.h>
-#include <freertos/queue.h>
+#include <freertos/timers.h>
+
+#if configUSE_TIMERS != 1 || INCLUDE_xTimerPendFunctionCall != 1
+#error "Pulse requires FreeRTOS timers and xTimerPendFunctionCall for safe callback-side destruction"
+#endif
 
 namespace {
 constexpr PulseTimerId kInvalidTimerId = 0;
 constexpr uint32_t kWaitPollMs = 10;
-constexpr EventBits_t kCompletionBit = BIT0;
+constexpr size_t kMinStackSizeBytes = 1024;
 
 enum class PulseLifecycleState : uint8_t {
 	Uninitialized,
 	Running,
 	Stopping,
-	Stopped,
+	Quiesced,
+	Reaping,
 };
 
 enum class PulseExecutionState : uint8_t {
@@ -45,6 +50,8 @@ struct PulseCommand {
 	uint64_t generation = 0;
 };
 
+using PulseCommandQueue = Strata::FreeRTOS::Queue<PulseCommand>;
+
 uint64_t pulseNowMs() {
 	return static_cast<uint64_t>(esp_timer_get_time() / 1000);
 }
@@ -57,10 +64,141 @@ bool isActiveState(PulseTimerState state) {
 	return state == PulseTimerState::Running || state == PulseTimerState::Paused;
 }
 
+bool isValidStackSize(size_t stackBytes) {
+	return stackBytes >= kMinStackSizeBytes && (stackBytes % sizeof(StackType_t)) == 0;
+}
+
 TickType_t waitTicksForMs(uint32_t milliseconds) {
 	const TickType_t ticks = pdMS_TO_TICKS(milliseconds);
 	return ticks > 0 ? ticks : 1;
 }
+
+class PulseLock {
+  public:
+	explicit PulseLock(Strata::FreeRTOS::RecursiveMutex &mutex)
+	    : _mutex(mutex), _locked(mutex.lock()) {
+	}
+
+	~PulseLock() {
+		if (_locked) {
+			_mutex.unlock();
+		}
+	}
+
+	PulseLock(const PulseLock &) = delete;
+	PulseLock &operator=(const PulseLock &) = delete;
+
+	explicit operator bool() const {
+		return _locked;
+	}
+
+  private:
+	Strata::FreeRTOS::RecursiveMutex &_mutex;
+	bool _locked = false;
+};
+
+template <typename T>
+class PulseSlotArray {
+	static_assert(std::is_nothrow_default_constructible_v<T>);
+	static_assert(std::is_nothrow_destructible_v<T>);
+
+  public:
+	PulseSlotArray() noexcept = default;
+
+	~PulseSlotArray() noexcept {
+		reset();
+	}
+
+	PulseSlotArray(const PulseSlotArray &) = delete;
+	PulseSlotArray &operator=(const PulseSlotArray &) = delete;
+
+	PulseSlotArray(PulseSlotArray &&other) noexcept {
+		moveFrom(other);
+	}
+
+	PulseSlotArray &operator=(PulseSlotArray &&other) noexcept {
+		if (this != &other) {
+			reset();
+			moveFrom(other);
+		}
+		return *this;
+	}
+
+	bool allocate(size_t count, Strata::Placement placement) noexcept {
+		reset();
+		if (count == 0) {
+			return false;
+		}
+
+		T *storage = Strata::allocateArray<T>(count, placement);
+		if (storage == nullptr) {
+			return false;
+		}
+
+		_data = storage;
+		_count = count;
+		_placement = placement;
+		for (size_t index = 0; index < _count; index++) {
+			std::construct_at(_data + index);
+		}
+		return true;
+	}
+
+	void reset() noexcept {
+		if (_data != nullptr) {
+			for (size_t index = 0; index < _count; index++) {
+				std::destroy_at(_data + index);
+			}
+			Strata::free(_data);
+		}
+		_data = nullptr;
+		_count = 0;
+		_placement = Strata::Placement::Default;
+	}
+
+	T &operator[](size_t index) noexcept {
+		return _data[index];
+	}
+
+	const T &operator[](size_t index) const noexcept {
+		return _data[index];
+	}
+
+	T *data() noexcept {
+		return _data;
+	}
+
+	const T *data() const noexcept {
+		return _data;
+	}
+
+	size_t size() const noexcept {
+		return _count;
+	}
+
+	Strata::Placement placement() const noexcept {
+		return _placement;
+	}
+
+	Strata::Region region() const noexcept {
+		return Strata::regionOf(_data);
+	}
+
+	explicit operator bool() const noexcept {
+		return _data != nullptr;
+	}
+
+  private:
+	void moveFrom(PulseSlotArray &other) noexcept {
+		_data = std::exchange(other._data, nullptr);
+		_count = std::exchange(other._count, 0);
+		_placement = std::exchange(other._placement, Strata::Placement::Default);
+	}
+
+	T *_data = nullptr;
+	size_t _count = 0;
+	Strata::Placement _placement = Strata::Placement::Default;
+};
 } // namespace
 
 struct PulseTimerRecord {
@@ -81,21 +219,20 @@ struct PulseTimerRecord {
 	uint64_t nextDueMs = 0;
 };
 
+using PulseTimerPtr = std::shared_ptr<PulseTimerRecord>;
+using PulseTimerSlots = PulseSlotArray<PulseTimerPtr>;
+
 struct PulseImpl {
-	PulseImpl() : completionEvent(xEventGroupCreate()) {
+	PulseImpl() noexcept : mutex(Strata::FreeRTOS::RecursiveMutex::create()) {
 	}
 
-	~PulseImpl() {
-		if (completionEvent != nullptr) {
-			vEventGroupDelete(completionEvent);
-		}
-	}
+	~PulseImpl() noexcept = default;
 
 	PulseImpl(const PulseImpl &) = delete;
 	PulseImpl &operator=(const PulseImpl &) = delete;
 
 	bool valid() const {
-		return mutex.valid() && completionEvent != nullptr;
+		return mutex.valid();
 	}
 
 	void retain() noexcept {
@@ -104,33 +241,34 @@ struct PulseImpl {
 
 	void release() noexcept {
 		if (referenceCount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-			delete this;
+			Strata::destroy(this);
 		}
 	}
 
 	std::atomic<uint32_t> referenceCount{1};
 	PulseConfig config{};
-	PulseMutex mutex;
-	EventGroupHandle_t completionEvent = nullptr;
-	std::unique_ptr<std::shared_ptr<PulseTimerRecord>[]> timers;
-	std::unique_ptr<std::shared_ptr<PulseTimerRecord>[]> activeTimers;
+	Strata::FreeRTOS::RecursiveMutex mutex;
+	PulseTimerSlots timers;
+	PulseTimerSlots activeTimers;
 	uint32_t timerCapacity = 0;
 	uint32_t timerCount = 0;
 	uint32_t activeTimerCount = 0;
-	QueueHandle_t commandQueue = nullptr;
-	TaskHandle_t taskHandle = nullptr;
+	PulseCommandQueue commandQueue;
+	Strata::FreeRTOS::Task task;
 	PulseLifecycleState lifecycle = PulseLifecycleState::Uninitialized;
 	uint64_t lifecycleGeneration = 0;
-	bool createdWithCaps = false;
-	PulseStackType actualStackType = PulseStackType::Internal;
+	bool orphaned = false;
 	PulseTimerId nextTimerId = 1;
 	uint32_t executedCallbackCount = 0;
 	uint32_t droppedCommandCount = 0;
 	uint32_t lateCallbackCount = 0;
 	size_t finalStackHighWaterMarkBytes = 0;
+	Strata::Region taskStackRegion = Strata::Region::Unknown;
+	Strata::Placement commandQueueStoragePlacement = Strata::Placement::Default;
+	Strata::Region commandQueueStorageRegion = Strata::Region::Unknown;
 
 	bool isCurrentTaskLocked() const {
-		return taskHandle != nullptr && xTaskGetCurrentTaskHandle() == taskHandle;
+		return task.valid() && xTaskGetCurrentTaskHandle() == task.handle();
 	}
 
 	bool isRunningGenerationLocked(uint64_t generation) const {
@@ -154,7 +292,19 @@ struct PulseImpl {
 		return PulseTimerResult::failure(PulseStatus::Busy, "pulse lifecycle is not running");
 	}
 
-	std::shared_ptr<PulseTimerRecord> findTimerLocked(PulseTimerId id) {
+	PulseTimerResult timerAllocationPlacement(Strata::Placement &out) {
+		PulseLock lock(mutex);
+		if (!lock) {
+			return PulseTimerResult::failure(PulseStatus::InternalError, "failed to lock pulse");
+		}
+		if (lifecycle != PulseLifecycleState::Running) {
+			return unavailableTimerResultLocked();
+		}
+		out = config.memory.allocation;
+		return PulseTimerResult::success(kInvalidTimerId);
+	}
+
+	PulseTimerPtr findTimerLocked(PulseTimerId id) {
 		for (uint32_t index = 0; index < timerCount; index++) {
 			auto &timer = timers[index];
 			if (timer && timer->id == id) {
@@ -219,7 +369,7 @@ struct PulseImpl {
 		return false;
 	}
 
-	bool addRegistryLocked(const std::shared_ptr<PulseTimerRecord> &timer) {
+	bool addRegistryLocked(const PulseTimerPtr &timer) {
 		if (!timer || timerCount >= timerCapacity) {
 			return false;
 		}
@@ -244,9 +394,9 @@ struct PulseImpl {
 		activeTimerCount = writeIndex;
 	}
 
-	std::shared_ptr<PulseTimerRecord> removeRegistryLocked(PulseTimerId id) {
+	PulseTimerPtr removeRegistryLocked(PulseTimerId id) {
 		removeActiveLocked(id);
-		std::shared_ptr<PulseTimerRecord> removed;
+		PulseTimerPtr removed;
 		uint32_t writeIndex = 0;
 		for (uint32_t readIndex = 0; readIndex < timerCount; readIndex++) {
 			auto &timer = timers[readIndex];
@@ -270,7 +420,7 @@ struct PulseImpl {
 		return removed;
 	}
 
-	void insertActiveLocked(const std::shared_ptr<PulseTimerRecord> &timer) {
+	void insertActiveLocked(const PulseTimerPtr &timer) {
 		if (!timer || timer->state != PulseTimerState::Running) {
 			return;
 		}
@@ -280,10 +430,9 @@ struct PulseImpl {
 		}
 		activeTimers[activeTimerCount++] = timer;
 		std::sort(
-		    activeTimers.get(),
-		    activeTimers.get() + activeTimerCount,
-		    [](const std::shared_ptr<PulseTimerRecord> &left,
-		       const std::shared_ptr<PulseTimerRecord> &right) {
+		    activeTimers.data(),
+		    activeTimers.data() + activeTimerCount,
+		    [](const PulseTimerPtr &left, const PulseTimerPtr &right) {
 			    if (!left) {
 				    return false;
 			    }
@@ -299,14 +448,15 @@ struct PulseImpl {
 	}
 
 	void notifyTaskLocked() {
-		if (taskHandle != nullptr) {
-			xTaskNotifyGive(taskHandle);
+		if (task.valid()) {
+			(void)xTaskNotifyGive(task.handle());
 		}
 	}
 
 	PulseResult requestStopLocked() {
 		if (lifecycle == PulseLifecycleState::Uninitialized ||
-		    lifecycle == PulseLifecycleState::Stopped) {
+		    lifecycle == PulseLifecycleState::Quiesced ||
+		    lifecycle == PulseLifecycleState::Reaping) {
 			return PulseResult::success("pulse already stopped");
 		}
 		if (lifecycle == PulseLifecycleState::Running) {
@@ -320,7 +470,7 @@ struct PulseImpl {
 		if (lifecycle != PulseLifecycleState::Running) {
 			return unavailableResultLocked();
 		}
-		if (commandQueue == nullptr || taskHandle == nullptr) {
+		if (!commandQueue.valid() || !task.valid()) {
 			return PulseResult::failure(PulseStatus::InternalError, "pulse scheduler is unavailable");
 		}
 
@@ -329,7 +479,7 @@ struct PulseImpl {
 		command.id = id;
 		command.generation = lifecycleGeneration;
 
-		if (xQueueSend(commandQueue, &command, 0) != pdTRUE) {
+		if (!commandQueue.send(command, 0)) {
 			droppedCommandCount++;
 			return PulseResult::failure(PulseStatus::QueueFull, "pulse command queue is full");
 		}
@@ -338,7 +488,7 @@ struct PulseImpl {
 	}
 
 	void processCommand(const PulseCommand &command) {
-		std::shared_ptr<PulseTimerRecord> detached;
+		PulseTimerPtr detached;
 		{
 			PulseLock lock(mutex);
 			if (!lock || !isRunningGenerationLocked(command.generation)) {
@@ -403,8 +553,8 @@ struct PulseImpl {
 	}
 
 	uint32_t queueUsageLocked() const {
-		return commandQueue != nullptr ?
-		           static_cast<uint32_t>(uxQueueMessagesWaiting(commandQueue)) :
+		return commandQueue.valid() ?
+		           static_cast<uint32_t>(uxQueueMessagesWaiting(commandQueue.handle())) :
 		           0;
 	}
 
@@ -419,21 +569,15 @@ struct PulseImpl {
 	void processQueuedCommandsSnapshot(uint32_t commandCount, uint64_t generation) {
 		const uint32_t boundedCount = std::min(commandCount, config.commandQueueSize);
 		for (uint32_t index = 0; index < boundedCount; index++) {
-			QueueHandle_t queue = nullptr;
+			PulseCommand command;
 			{
 				PulseLock lock(mutex);
 				if (!lock || !isRunningGenerationLocked(generation)) {
 					return;
 				}
-				queue = commandQueue;
-			}
-			if (queue == nullptr) {
-				return;
-			}
-
-			PulseCommand command;
-			if (xQueueReceive(queue, &command, 0) != pdTRUE) {
-				return;
+				if (!commandQueue.receive(command, 0)) {
+					return;
+				}
 			}
 			processCommand(command);
 		}
@@ -464,7 +608,7 @@ struct PulseImpl {
 		return waitTicksForMs(static_cast<uint32_t>(remainingMs));
 	}
 
-	bool takeDueTimer(std::shared_ptr<PulseTimerRecord> &out, uint64_t &dueMs) {
+	bool takeDueTimer(PulseTimerPtr &out, uint64_t &dueMs) {
 		PulseLock lock(mutex);
 		if (!lock || lifecycle != PulseLifecycleState::Running || queueUsageLocked() > 0) {
 			return false;
@@ -493,7 +637,7 @@ struct PulseImpl {
 		return false;
 	}
 
-	void executeTimer(const std::shared_ptr<PulseTimerRecord> &timer, uint64_t dueMs) {
+	void executeTimer(const PulseTimerPtr &timer, uint64_t dueMs) {
 		if (!timer) {
 			return;
 		}
@@ -612,7 +756,7 @@ struct PulseImpl {
 				continue;
 			}
 
-			std::shared_ptr<PulseTimerRecord> timer;
+			PulseTimerPtr timer;
 			uint64_t dueMs = 0;
 			if (takeDueTimer(timer, dueMs)) {
 				executeTimer(timer, dueMs);
@@ -627,62 +771,88 @@ struct PulseImpl {
 		}
 	}
 
-	void quiesceAndDeleteSelf() {
-		std::unique_ptr<std::shared_ptr<PulseTimerRecord>[]> detachedTimers;
-		std::unique_ptr<std::shared_ptr<PulseTimerRecord>[]> detachedActiveTimers;
-		QueueHandle_t detachedQueue = nullptr;
-		bool withCaps = false;
+	static void orphanReapThunk(void *arg, uint32_t) {
+		PulseImpl *impl = static_cast<PulseImpl *>(arg);
+		if (impl == nullptr) {
+			return;
+		}
+
+		{
+			PulseLock lock(impl->mutex);
+			if (!lock || !impl->orphaned || impl->lifecycle != PulseLifecycleState::Quiesced) {
+				return;
+			}
+			impl->lifecycle = PulseLifecycleState::Reaping;
+		}
+
+		impl->task.reset();
+
+		{
+			PulseLock lock(impl->mutex);
+			if (lock && impl->lifecycle == PulseLifecycleState::Reaping) {
+				impl->lifecycle = PulseLifecycleState::Uninitialized;
+				impl->orphaned = false;
+			}
+		}
+
+		impl->release();
+	}
+
+	void quiesceAndAwaitReap() {
+		PulseTimerSlots detachedTimers;
+		PulseTimerSlots detachedActiveTimers;
+		PulseCommandQueue detachedQueue;
+		bool shouldSelfScheduleReap = false;
 
 		{
 			PulseLock lock(mutex);
 			if (lock) {
 				detachedTimers = std::move(timers);
 				detachedActiveTimers = std::move(activeTimers);
-				detachedQueue = commandQueue;
-				commandQueue = nullptr;
+				detachedQueue = std::move(commandQueue);
 				timerCapacity = 0;
 				timerCount = 0;
 				activeTimerCount = 0;
 				nextTimerId = 1;
-				withCaps = createdWithCaps;
 			}
 		}
 
 		detachedActiveTimers.reset();
 		detachedTimers.reset();
-		if (detachedQueue != nullptr) {
-			vQueueDelete(detachedQueue);
-		}
+		detachedQueue.reset();
 
-		const size_t finalStack = pulse_task_support::currentStackHighWaterMarkBytes();
+		const size_t finalStack = task.stackHighWaterMarkBytes();
 		{
 			PulseLock lock(mutex);
 			if (lock) {
 				finalStackHighWaterMarkBytes = finalStack;
-				taskHandle = nullptr;
-				lifecycle = PulseLifecycleState::Stopped;
-				if (completionEvent != nullptr) {
-					xEventGroupSetBits(completionEvent, kCompletionBit);
-				}
+				lifecycle = PulseLifecycleState::Quiesced;
+				shouldSelfScheduleReap = orphaned;
 			}
 		}
 
-		release();
-		pulse_task_support::deleteCurrentTask(withCaps);
+		if (shouldSelfScheduleReap) {
+			while (xTimerPendFunctionCall(&PulseImpl::orphanReapThunk, this, 0, portMAX_DELAY) !=
+			       pdPASS) {
+				vTaskDelay(1);
+			}
+		}
+
 		for (;;) {
-			vTaskDelay(portMAX_DELAY);
+			ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 		}
 	}
 
 	static void taskEntry(void *arg) {
 		PulseImpl *impl = static_cast<PulseImpl *>(arg);
 		if (impl == nullptr) {
-			vTaskDelete(nullptr);
-			return;
+			for (;;) {
+				vTaskDelay(portMAX_DELAY);
+			}
 		}
 		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 		impl->taskLoop();
-		impl->quiesceAndDeleteSelf();
+		impl->quiesceAndAwaitReap();
 	}
 };
 
@@ -712,6 +882,7 @@ PulseResult endImpl(PulseImpl *impl, uint32_t timeoutMs, bool waitForever) {
 
 	const uint64_t startMs = pulseNowMs();
 	while (true) {
+		bool reapTask = false;
 		{
 			PulseLock lock(impl->mutex);
 			if (!lock) {
@@ -723,16 +894,32 @@ PulseResult endImpl(PulseImpl *impl, uint32_t timeoutMs, bool waitForever) {
 			if (impl->lifecycle == PulseLifecycleState::Uninitialized) {
 				return PulseResult::success("pulse ended");
 			}
-			if (impl->lifecycle == PulseLifecycleState::Stopped) {
-				impl->lifecycle = PulseLifecycleState::Uninitialized;
-				return PulseResult::success("pulse ended");
-			}
-			if (impl->lifecycle != PulseLifecycleState::Stopping) {
+			if (impl->lifecycle == PulseLifecycleState::Quiesced) {
+				impl->lifecycle = PulseLifecycleState::Reaping;
+				reapTask = true;
+			} else if (impl->lifecycle != PulseLifecycleState::Stopping &&
+			           impl->lifecycle != PulseLifecycleState::Reaping) {
 				return PulseResult::failure(
 				    PulseStatus::InternalError,
 				    "unexpected pulse lifecycle state"
 				);
 			}
+		}
+
+		if (reapTask) {
+			impl->task.reset();
+			{
+				PulseLock lock(impl->mutex);
+				if (!lock) {
+					return PulseResult::failure(PulseStatus::InternalError, "failed to lock pulse");
+				}
+				if (impl->lifecycleGeneration == targetGeneration &&
+				    impl->lifecycle == PulseLifecycleState::Reaping) {
+					impl->lifecycle = PulseLifecycleState::Uninitialized;
+				}
+			}
+			impl->release();
+			return PulseResult::success("pulse ended");
 		}
 
 		if (!waitForever && pulseNowMs() - startMs >= timeoutMs) {
@@ -748,13 +935,7 @@ PulseResult endImpl(PulseImpl *impl, uint32_t timeoutMs, bool waitForever) {
 			}
 			waitMs = static_cast<uint32_t>(std::min<uint64_t>(remaining, kWaitPollMs));
 		}
-		xEventGroupWaitBits(
-		    impl->completionEvent,
-		    kCompletionBit,
-		    pdFALSE,
-		    pdFALSE,
-		    waitTicksForMs(waitMs)
-		);
+		vTaskDelay(waitTicksForMs(waitMs));
 	}
 }
 
@@ -842,6 +1023,7 @@ Pulse::~Pulse() {
 		if (lock) {
 			selfDestruction = impl->isCurrentTaskLocked();
 			if (selfDestruction) {
+				impl->orphaned = true;
 				impl->requestStopLocked();
 			}
 		}
@@ -864,7 +1046,11 @@ Pulse::~Pulse() {
 }
 
 PulseResult Pulse::init(const PulseConfig &config) {
-	if (!pulse_task_support::isValidStackSize(config.stackSizeBytes)) {
+	if (!Strata::validPlacement(config.memory.allocation) ||
+	    !Strata::validPlacement(config.memory.taskStack)) {
+		return PulseResult::failure(PulseStatus::InvalidArgument, "invalid Strata memory placement");
+	}
+	if (!isValidStackSize(config.stackSizeBytes)) {
 		return PulseResult::failure(
 		    PulseStatus::InvalidArgument,
 		    "stack size must be at least 1024 bytes and aligned"
@@ -888,7 +1074,7 @@ PulseResult Pulse::init(const PulseConfig &config) {
 
 	PulseImpl *impl = _impl.load(std::memory_order_acquire);
 	if (impl == nullptr) {
-		PulseImpl *candidate = new (std::nothrow) PulseImpl();
+		PulseImpl *candidate = Strata::create<PulseImpl>(Strata::Placement::Internal);
 		if (candidate == nullptr || !candidate->valid()) {
 			if (candidate != nullptr) {
 				candidate->release();
@@ -912,24 +1098,6 @@ PulseResult Pulse::init(const PulseConfig &config) {
 		}
 	}
 
-	bool usePsramStack = false;
-	PulseStackType actualStackType = PulseStackType::Internal;
-	if (config.stackType == PulseStackType::Psram) {
-		if (!pulse_task_support::hasExternalStackSupport()) {
-			return PulseResult::failure(
-			    PulseStatus::TaskCreateFailed,
-			    "PSRAM task stacks are not available"
-			);
-		}
-		usePsramStack = true;
-		actualStackType = PulseStackType::Psram;
-	} else if (
-	    config.stackType == PulseStackType::Auto && pulse_task_support::hasExternalStackSupport()
-	) {
-		usePsramStack = true;
-		actualStackType = PulseStackType::Psram;
-	}
-
 	PulseLock lock(impl->mutex);
 	if (!lock) {
 		return PulseResult::failure(PulseStatus::InternalError, "failed to lock pulse");
@@ -942,68 +1110,72 @@ PulseResult Pulse::init(const PulseConfig &config) {
 	}
 
 	impl->config = config;
-	impl->actualStackType = actualStackType;
-	impl->createdWithCaps = false;
+	impl->orphaned = false;
 	impl->executedCallbackCount = 0;
 	impl->droppedCommandCount = 0;
 	impl->lateCallbackCount = 0;
 	impl->finalStackHighWaterMarkBytes = 0;
+	impl->taskStackRegion = Strata::Region::Unknown;
+	impl->commandQueueStoragePlacement = config.memory.allocation;
+	impl->commandQueueStorageRegion = Strata::Region::Unknown;
 	impl->nextTimerId = 1;
 	impl->timerCapacity = timerCapacity;
 	impl->timerCount = 0;
 	impl->activeTimerCount = 0;
-	impl->timers.reset(new (std::nothrow) std::shared_ptr<PulseTimerRecord>[timerCapacity]);
-	impl->activeTimers.reset(
-	    new (std::nothrow) std::shared_ptr<PulseTimerRecord>[timerCapacity]
-	);
-	if (!impl->timers || !impl->activeTimers) {
+
+	if (!impl->timers.allocate(timerCapacity, config.memory.allocation) ||
+	    !impl->activeTimers.allocate(timerCapacity, config.memory.allocation)) {
 		impl->timers.reset();
 		impl->activeTimers.reset();
 		impl->timerCapacity = 0;
 		return PulseResult::failure(PulseStatus::OutOfMemory, "failed to allocate timer storage");
 	}
 
-	impl->commandQueue = xQueueCreate(config.commandQueueSize, sizeof(PulseCommand));
-	if (impl->commandQueue == nullptr) {
+	impl->commandQueue = PulseCommandQueue::create({
+	    .length = config.commandQueueSize,
+	    .storagePlacement = config.memory.allocation,
+	    .usage = Strata::FreeRTOS::QueueUsage::TaskOnly,
+	});
+	if (!impl->commandQueue) {
 		impl->timers.reset();
 		impl->activeTimers.reset();
 		impl->timerCapacity = 0;
 		return PulseResult::failure(PulseStatus::QueueCreateFailed, "failed to create command queue");
 	}
+	impl->commandQueueStoragePlacement = impl->commandQueue.storagePlacement();
+	impl->commandQueueStorageRegion = impl->commandQueue.storageRegion();
 
-	xEventGroupClearBits(impl->completionEvent, kCompletionBit);
 	impl->retain();
-	TaskHandle_t handle = nullptr;
-	bool createdWithCaps = false;
-	const BaseType_t created = pulse_task_support::createTask(
+	auto schedulerTask = Strata::FreeRTOS::Task::create(
 	    &PulseImpl::taskEntry,
-	    config.taskName != nullptr ? config.taskName : "pulse-task",
-	    config.stackSizeBytes,
 	    impl,
-	    config.priority,
-	    &handle,
-	    config.coreId,
-	    usePsramStack,
-	    createdWithCaps
+	    Strata::FreeRTOS::TaskConfig{
+	        .name = config.taskName != nullptr ? config.taskName : "pulse-task",
+	        .stackBytes = config.stackSizeBytes,
+	        .stackPlacement = config.memory.taskStack,
+	        .priority = config.priority,
+	        .affinity = static_cast<int32_t>(config.coreId),
+	    }
 	);
-	if (created != pdPASS || handle == nullptr) {
+	if (!schedulerTask) {
 		impl->release();
-		vQueueDelete(impl->commandQueue);
-		impl->commandQueue = nullptr;
+		impl->commandQueue.reset();
 		impl->timers.reset();
 		impl->activeTimers.reset();
 		impl->timerCapacity = 0;
+		impl->commandQueueStorageRegion = Strata::Region::Unknown;
 		return PulseResult::failure(PulseStatus::TaskCreateFailed, "failed to create pulse task");
 	}
 
+	const TaskHandle_t handle = schedulerTask.handle();
+	impl->taskStackRegion = schedulerTask.stackRegion();
+	impl->task = std::move(schedulerTask);
 	impl->lifecycleGeneration++;
 	if (impl->lifecycleGeneration == 0) {
 		impl->lifecycleGeneration++;
 	}
-	impl->taskHandle = handle;
-	impl->createdWithCaps = createdWithCaps;
 	impl->lifecycle = PulseLifecycleState::Running;
-	xTaskNotifyGive(handle);
+	(void)xTaskNotifyGive(handle);
 	return PulseResult::success("pulse initialized");
 }
 
@@ -1023,11 +1195,15 @@ PulseTimerResult Pulse::setTimeout(PulseCallback callback, uint32_t delayMs) {
 		return PulseTimerResult::failure(PulseStatus::NotInitialized, "pulse is not initialized");
 	}
 
-	PulseTimerRecord *rawTimer = new (std::nothrow) PulseTimerRecord();
-	if (rawTimer == nullptr) {
+	Strata::Placement placement = Strata::Placement::Default;
+	PulseTimerResult access = impl->timerAllocationPlacement(placement);
+	if (!access) {
+		return access;
+	}
+	PulseTimerPtr timer = Strata::makeShared<PulseTimerRecord>(placement);
+	if (!timer) {
 		return PulseTimerResult::failure(PulseStatus::OutOfMemory, "failed to allocate timer");
 	}
-	std::shared_ptr<PulseTimerRecord> timer(rawTimer);
 	timer->callback = std::move(callback);
 
 	PulseLock lock(impl->mutex);
@@ -1068,11 +1244,15 @@ PulseTimerResult Pulse::setInterval(PulseCallback callback, uint32_t intervalMs)
 		return PulseTimerResult::failure(PulseStatus::NotInitialized, "pulse is not initialized");
 	}
 
-	PulseTimerRecord *rawTimer = new (std::nothrow) PulseTimerRecord();
-	if (rawTimer == nullptr) {
+	Strata::Placement placement = Strata::Placement::Default;
+	PulseTimerResult access = impl->timerAllocationPlacement(placement);
+	if (!access) {
+		return access;
+	}
+	PulseTimerPtr timer = Strata::makeShared<PulseTimerRecord>(placement);
+	if (!timer) {
 		return PulseTimerResult::failure(PulseStatus::OutOfMemory, "failed to allocate timer");
 	}
-	std::shared_ptr<PulseTimerRecord> timer(rawTimer);
 	timer->callback = std::move(callback);
 
 	PulseLock lock(impl->mutex);
@@ -1125,11 +1305,15 @@ PulseTimerResult Pulse::setCountdown(
 		return PulseTimerResult::failure(PulseStatus::NotInitialized, "pulse is not initialized");
 	}
 
-	PulseTimerRecord *rawTimer = new (std::nothrow) PulseTimerRecord();
-	if (rawTimer == nullptr) {
+	Strata::Placement placement = Strata::Placement::Default;
+	PulseTimerResult access = impl->timerAllocationPlacement(placement);
+	if (!access) {
+		return access;
+	}
+	PulseTimerPtr timer = Strata::makeShared<PulseTimerRecord>(placement);
+	if (!timer) {
 		return PulseTimerResult::failure(PulseStatus::OutOfMemory, "failed to allocate timer");
 	}
-	std::shared_ptr<PulseTimerRecord> timer(rawTimer);
 	timer->countdownCallback = std::move(callback);
 
 	PulseLock lock(impl->mutex);
@@ -1235,8 +1419,7 @@ PulseTimerState Pulse::getState(PulseTimerId id) {
 		return PulseTimerState::NotFound;
 	}
 	PulseLock lock(impl->mutex);
-	if (!lock || impl->lifecycle == PulseLifecycleState::Stopped ||
-	    impl->lifecycle == PulseLifecycleState::Uninitialized) {
+	if (!lock || impl->lifecycle != PulseLifecycleState::Running) {
 		return PulseTimerState::NotFound;
 	}
 	auto timer = impl->findTimerLocked(id);
@@ -1260,12 +1443,16 @@ PulseDiag Pulse::getDiagnostics() {
 	diag.droppedCommandCount = impl->droppedCommandCount;
 	diag.lateCallbackCount = impl->lateCallbackCount;
 	diag.stackHighWaterMarkBytes = impl->finalStackHighWaterMarkBytes;
-	diag.requestedStackType = impl->config.stackType;
-	diag.actualStackType = impl->actualStackType;
+	diag.requestedStackPlacement = impl->config.memory.taskStack;
+	diag.stackRegion = impl->taskStackRegion;
+	diag.commandQueueStoragePlacement = impl->commandQueueStoragePlacement;
+	diag.commandQueueStorageRegion = impl->commandQueueStorageRegion;
 
-	if (impl->taskHandle != nullptr) {
-		diag.stackHighWaterMarkBytes =
-		    pulse_task_support::stackHighWaterMarkBytes(impl->taskHandle);
+	if ((impl->lifecycle == PulseLifecycleState::Running ||
+	     impl->lifecycle == PulseLifecycleState::Stopping ||
+	     impl->lifecycle == PulseLifecycleState::Quiesced) &&
+	    impl->task.valid()) {
+		diag.stackHighWaterMarkBytes = impl->task.stackHighWaterMarkBytes();
 	}
 	for (uint32_t index = 0; index < impl->timerCount; index++) {
 		const auto &timer = impl->timers[index];

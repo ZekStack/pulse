@@ -206,6 +206,36 @@ bool testRepeatedLifecycleCycles() {
 	return true;
 }
 
+bool testStrataMemoryPolicy() {
+	Pulse pulse;
+	PulseConfig config;
+	config.memory.allocation = Strata::Placement::PreferExternal;
+	config.memory.taskStack = Strata::Placement::PreferExternal;
+	REQUIRE(pulse.init(config));
+
+	const PulseDiag diag = pulse.getDiagnostics();
+	REQUIRE(diag.requestedStackPlacement == Strata::Placement::PreferExternal);
+	REQUIRE(diag.commandQueueStoragePlacement == Strata::Placement::PreferExternal);
+	REQUIRE(diag.stackRegion == Strata::Region::Unknown);
+	REQUIRE(diag.commandQueueStorageRegion == Strata::Region::Unknown);
+	REQUIRE(pulse.end());
+
+	Pulse strictStack;
+	PulseConfig strictStackConfig;
+	strictStackConfig.memory.taskStack = Strata::Placement::RequireExternal;
+	const PulseResult strictStackResult = strictStack.init(strictStackConfig);
+	REQUIRE(!strictStackResult);
+	REQUIRE(strictStackResult.status == PulseStatus::TaskCreateFailed);
+
+	Pulse strictAllocation;
+	PulseConfig strictAllocationConfig;
+	strictAllocationConfig.memory.allocation = Strata::Placement::RequireExternal;
+	const PulseResult strictAllocationResult = strictAllocation.init(strictAllocationConfig);
+	REQUIRE(!strictAllocationResult);
+	REQUIRE(strictAllocationResult.status == PulseStatus::OutOfMemory);
+	return true;
+}
+
 struct TestCase {
 	const char *name;
 	bool (*run)();
@@ -218,6 +248,7 @@ constexpr TestCase tests[] = {
     {"self-pause-interval", &testSelfPausePreservesFullInterval},
     {"long-callback-shutdown", &testLongCallbackEndTimeoutAndRetry},
     {"repeated-lifecycle", &testRepeatedLifecycleCycles},
+    {"strata-memory-policy", &testStrataMemoryPolicy},
 };
 } // namespace
 

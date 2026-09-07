@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [ '**' ]
+    branches: [ 'main' ]
     tags: ['v*']
   pull_request:
   workflow_dispatch:
@@ -19,16 +19,18 @@ env:
   PIOARDUINO_PLATFORM_URL: https://github.com/pioarduino/platform-espressif32/releases/download/55.03.39/platform-espressif32.zip
   PIOARDUINO_PLATFORM_VERSION: 55.03.39
   PIOARDUINO_VERSION: 6.1.19
+  STRATA_VERSION: v0.1.2
 
 jobs:
   source-audit:
-    runs-on: [self-hosted, zekstack-ci]
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Audit production sources
         run: |
+          set -e
           if grep -RInE '(^|[^[:alnum:]_])throw([^[:alnum:]_]|$)|std::abort[[:space:]]*\(' src; then
             echo "Embedded safety audit failed: throw/std::abort is not allowed"
             exit 1
@@ -49,12 +51,12 @@ jobs:
             echo "Embedded safety audit failed: PulseCommand queue must store values"
             exit 1
           fi
-          if grep -RInF 'new (std::nothrow) PulseCommand' src; then
-            echo "Embedded safety audit failed: PulseCommand must not be heap allocated"
+          if grep -RInE 'heap_caps_|MALLOC_CAP_|ps_malloc|xTaskCreate|vTaskDelete|xQueueCreate|vQueueDelete|xSemaphoreCreate|xEventGroupCreate|vEventGroupDelete|std::make_unique|std::make_shared|(^|[^:[:alnum:]_])malloc[[:space:]]*\(|(^|[^:[:alnum:]_])calloc[[:space:]]*\(|(^|[^:[:alnum:]_])realloc[[:space:]]*\(|(^|[^:[:alnum:]_])free[[:space:]]*\(|(^|[^[:alnum:]_])new[[:space:](]|(^|[^[:alnum:]_])delete[[:space:](]' src; then
+            echo "Pulse allocations and owned FreeRTOS primitives must route through Strata"
             exit 1
           fi
-          if grep -RInF 'delete command' src; then
-            echo "Embedded safety audit failed: PulseCommand must not require delete"
+          if grep -RInE '#include[[:space:]]+[<\"]esp_heap_caps\.h[>\"]|freertos/idf_additions\.h' src; then
+            echo "Pulse must not depend on ESP-IDF allocation internals"
             exit 1
           fi
           result_message_accessor='.message'
@@ -64,7 +66,7 @@ jobs:
           fi
 
   release-version-check:
-    runs-on: [self-hosted, zekstack-ci]
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -79,16 +81,28 @@ jobs:
           fi
 
   host-tests:
-    runs-on: [self-hosted, zekstack-ci]
+    runs-on: ubuntu-latest
     needs: source-audit
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Checkout Strata
+        run: |
+          rm -rf build/strata
+          git clone --depth 1 --branch "${STRATA_VERSION}" \
+            https://github.com/ZekStack/strata.git build/strata
+
       - name: Build host runtime tests
         run: |
           mkdir -p build/host-tests
-          common_sources=(src/Pulse.cpp tests/host/freertos_fake.cpp)
+          common_sources=(
+            src/Pulse.cpp
+            tests/host/freertos_fake.cpp
+            build/strata/src/strata/Allocation.cpp
+            build/strata/src/strata/Diagnostics.cpp
+            build/strata/src/strata/internal/PlatformGeneric.cpp
+          )
           common_flags=(
             -std=c++20
             -pthread
@@ -97,6 +111,7 @@ jobs:
             -Wpedantic
             -Itests/host/include
             -Isrc
+            -Ibuild/strata/src
           )
           g++ "${common_flags[@]}" \
             "${common_sources[@]}" \
@@ -122,8 +137,11 @@ jobs:
       - name: Long callback shutdown timeout and retry
         run: ./build/host-tests/pulse-host-tests long-callback-shutdown
 
-      - name: Repeated lifecycle cycles
+      - name: Repeated lifecycle cycles and callback destruction
         run: ./build/host-tests/pulse-host-tests repeated-lifecycle
+
+      - name: Strata memory policy
+        run: ./build/host-tests/pulse-host-tests strata-memory-policy
 
       - name: Scheduler ordering and countdown semantics
         run: ./build/host-tests/pulse-extended-tests scheduler-semantics
@@ -144,11 +162,17 @@ jobs:
         run: ./build/host-tests/pulse-extended-tests callback-command-batch
 
   no-exceptions-build:
-    runs-on: [self-hosted, zekstack-ci]
+    runs-on: ubuntu-latest
     needs: source-audit
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Checkout Strata
+        run: |
+          rm -rf build/strata
+          git clone --depth 1 --branch "${STRATA_VERSION}" \
+            https://github.com/ZekStack/strata.git build/strata
 
       - name: Compile production sources without exceptions
         run: |
@@ -162,11 +186,12 @@ jobs:
             -Wpedantic \
             -Itests/host/include \
             -Isrc \
+            -Ibuild/strata/src \
             -c src/Pulse.cpp \
             -o build/no-exceptions/Pulse.o
 
   build-examples:
-    runs-on: [self-hosted, zekstack-ci]
+    runs-on: ubuntu-latest
     needs: [source-audit, host-tests, no-exceptions-build, release-version-check]
     strategy:
       fail-fast: false
@@ -207,6 +232,7 @@ jobs:
                 --board ${{ matrix.board }} \
                 --lib="." \
                 --project-option "platform=${PIOARDUINO_PLATFORM_URL}" \
+                --project-option "lib_deps=https://github.com/ZekStack/strata.git#${STRATA_VERSION}" \
                 --project-option "build_unflags=-std=gnu++11" \
                 --project-option "build_flags=-std=gnu++20"
             fi
@@ -218,11 +244,12 @@ jobs:
             --board ${{ matrix.board }} \
             --lib="." \
             --project-option "platform=${PIOARDUINO_PLATFORM_URL}" \
+            --project-option "lib_deps=https://github.com/ZekStack/strata.git#${STRATA_VERSION}" \
             --project-option "build_unflags=-std=gnu++11" \
             --project-option "build_flags=-std=gnu++20 -DPULSE_SMOKE_USE_PSRAM=0"
 
   arduino-cli:
-    runs-on: [self-hosted, zekstack-ci]
+    runs-on: ubuntu-latest
     needs: [source-audit, host-tests, no-exceptions-build, release-version-check]
     strategy:
       fail-fast: false
@@ -260,12 +287,16 @@ jobs:
           arduino-cli core update-index
           arduino-cli core install "esp32:esp32@${ESP32_CORE_VERSION}"
 
-      - name: Add local library to sketchbook
+      - name: Add local libraries to sketchbook
         run: |
           set -e
           SKETCHBOOK_DIR="${HOME}/Arduino"
           mkdir -p "$SKETCHBOOK_DIR/libraries/Pulse"
           rsync -a --delete --exclude ".git" ./ "$SKETCHBOOK_DIR/libraries/Pulse/"
+          rm -rf "$SKETCHBOOK_DIR/libraries/Strata"
+          git clone --depth 1 --branch "${STRATA_VERSION}" \
+            https://github.com/ZekStack/strata.git \
+            "$SKETCHBOOK_DIR/libraries/Strata"
 
       - name: Build examples (${{ matrix.board.name }})
         env:
@@ -300,7 +331,7 @@ jobs:
       - no-exceptions-build
       - build-examples
       - arduino-cli
-    runs-on: [self-hosted, zekstack-ci]
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:

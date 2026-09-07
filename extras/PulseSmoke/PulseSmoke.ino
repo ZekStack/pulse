@@ -26,8 +26,10 @@ void check(bool condition, const char *message) {
 
 PulseConfig smokeConfig() {
 	PulseConfig config;
+	config.memory.allocation = Strata::Placement::PreferExternal;
+	config.memory.taskStack =
+	    PULSE_SMOKE_USE_PSRAM ? Strata::Placement::RequireExternal : Strata::Placement::Internal;
 	config.stackSizeBytes = 4096;
-	config.stackType = PULSE_SMOKE_USE_PSRAM ? PulseStackType::Psram : PulseStackType::Internal;
 	config.commandQueueSize = 16;
 	return config;
 }
@@ -80,8 +82,13 @@ void setup() {
 	PulseDiag diagnostics = pulse.getDiagnostics();
 	check(diagnostics.stackHighWaterMarkBytes > 0, "stack high-water mark is available");
 	check(
-	    diagnostics.actualStackType == smokeConfig().stackType,
-	    "requested task stack type is active"
+	    diagnostics.requestedStackPlacement == smokeConfig().memory.taskStack,
+	    "requested task stack placement is active"
+	);
+	check(
+	    diagnostics.stackRegion ==
+	        (PULSE_SMOKE_USE_PSRAM ? Strata::Region::External : Strata::Region::Internal),
+	    "task stack region matches requested placement"
 	);
 
 	volatile PulseStatus callbackEndStatus = PulseStatus::InternalError;
