@@ -2,6 +2,11 @@
 
 #include <stdint.h>
 
+// Pulse targets ESP-IDF's FreeRTOS port. Keep the host task fake on the same
+// stack-depth and high-water-mark byte semantics used by ESP32 while the
+// Strata allocator itself continues to use its generic host backend.
+#define ESP32 1
+
 #ifdef __cplusplus
 extern "C" {
 #endif
