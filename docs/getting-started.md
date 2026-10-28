@@ -4,7 +4,7 @@ Pulse schedules short runtime timers from one internal FreeRTOS task. Pulse `v0.
 
 ## Install
 
-Pulse `v0.2.0` requires Strata `v0.1.2` and C++20.
+Pulse `v0.2.0` requires Strata `v0.1.4` and C++20.
 
 ### PlatformIO
 
@@ -18,7 +18,7 @@ build_unflags =
   -std=gnu++11
 ```
 
-Pulse's `library.json` pins Strata `v0.1.2`, so PlatformIO resolves it transitively.
+Pulse's `library.json` pins Strata `v0.1.4`, so PlatformIO resolves it transitively.
 
 ### Arduino IDE
 
@@ -29,7 +29,7 @@ Arduino/libraries/Strata
 Arduino/libraries/Pulse
 ```
 
-Use Strata `v0.1.2` or a compatible later release.
+Use Strata `v0.1.4` or a compatible later release.
 
 ## First timer
 

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.0
+
+- Pin Strata to v0.1.4 for all build and CI consumers.
+- Increment Pulse's minor version to v0.3.0.
+
 ## 0.2.0
 
 ### Strata integration

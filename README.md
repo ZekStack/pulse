@@ -1,5 +1,7 @@
 # Pulse
 
+> Current version: **v0.3.0**. Strata is pinned to **v0.1.4**.
+
 Pulse is a millisecond timer library for ESP32. It schedules short runtime timeouts, intervals, and countdowns from one internal FreeRTOS task using monotonic uptime, so NTP sync, timezone changes, DST, and wall-clock corrections do not affect timer deadlines.
 
 Pulse `v0.2.0` uses [Strata](https://github.com/ZekStack/strata) for memory placement and owned FreeRTOS storage.
@@ -21,7 +23,7 @@ Pulse `v0.2.0` uses [Strata](https://github.com/ZekStack/strata) for memory plac
 
 ## Dependency
 
-Pulse `v0.2.0` requires Strata `v0.1.2`.
+Pulse `v0.3.0` requires Strata `v0.1.4`.
 
 ### PlatformIO
 
@@ -32,7 +34,7 @@ board = esp32dev
 framework = arduino
 
 lib_deps =
-  https://github.com/ZekStack/pulse.git#v0.2.0
+  https://github.com/ZekStack/pulse.git#v0.3.0
 
 build_flags =
   -std=gnu++20
