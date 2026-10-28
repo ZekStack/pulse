@@ -179,6 +179,14 @@ extern "C" void vTaskDelete(TaskHandle_t handle) {
 	handle->condition.wait(lock, [handle]() { return handle->exited; });
 }
 
+// External task deletion already waits for termination in this host fake;
+// suspension need not simulate core scheduling independently.
+extern "C" void vTaskSuspend(TaskHandle_t) {}
+
+// Strata checks whether a task is executing on an ESP32 core before freeing
+// its static stack. The fake synchronizes termination in vTaskDelete instead.
+extern "C" TaskHandle_t xTaskGetCurrentTaskHandleForCore(BaseType_t) { return nullptr; }
+
 extern "C" void vTaskDelay(TickType_t ticks) {
 	holdEndWaiterIfRequested();
 

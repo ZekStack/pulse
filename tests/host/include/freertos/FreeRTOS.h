@@ -43,6 +43,9 @@ typedef struct StaticSemaphore_t {
 #define configUSE_RECURSIVE_MUTEXES 1
 #define configUSE_TIMERS 1
 #define INCLUDE_vTaskDelete 1
+#define INCLUDE_vTaskSuspend 1
+#define configNUMBER_OF_CORES 2
+#define taskYIELD() ((void)0)
 #define INCLUDE_vTaskDelay 1
 #define INCLUDE_uxTaskGetStackHighWaterMark 1
 #define INCLUDE_xTimerPendFunctionCall 1
