@@ -51,6 +51,7 @@ TaskHandle_t xTaskCreateStaticPinnedToCore(
 );
 
 void vTaskDelete(TaskHandle_t handle);
+void vTaskSuspend(TaskHandle_t handle);
 void vTaskDelay(TickType_t ticks);
 TaskHandle_t xTaskGetCurrentTaskHandle(void);
 BaseType_t xTaskNotifyGive(TaskHandle_t handle);
